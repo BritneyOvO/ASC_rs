@@ -13,7 +13,6 @@ mod bytes;
 mod decompile;
 pub mod dex;
 pub mod findrefs;
-pub mod gui;
 mod opcodes;
 
 pub use apk::{find_refs, get_class_source, list_classes, manifest_xml, Options};

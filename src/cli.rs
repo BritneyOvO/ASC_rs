@@ -15,7 +15,6 @@ use crate::{find_refs, get_class_source, list_classes, manifest_xml, Result};
     about = "ASC tooling entry.",
     after_help = "\
 examples:
-  asc app.apk --gui
   asc getclass app.apk Lcom/poc/Main; -o Main.java
   asc getclass app.apk com.poc.Main --threads 16
   asc listclass app.apk -o classes.txt
@@ -121,15 +120,6 @@ pub fn run() -> i32 {
         let _ = cmd.print_long_help();
         println!();
         return 0;
-    }
-    if args.iter().any(|arg| arg == "--gui") {
-        return match crate::gui::launch(&args) {
-            Ok(()) => 0,
-            Err(err) => {
-                eprintln!("Error: {err}");
-                1
-            }
-        };
     }
     let cli = match Cli::try_parse_from(std::iter::once(String::from("asc")).chain(args)) {
         Ok(cli) => cli,

@@ -286,43 +286,6 @@ fn manifest_roundtrip_through_apk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn gui_open_and_find() {
-    let dir = std::env::temp_dir().join(format!("asc-gui-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let apk = write_apk(
-        &dir,
-        "app.apk",
-        &[("classes.dex", &support::make_dex())],
-        false,
-    );
-    let session = asc::gui::Session {
-        apk,
-        threads: 1,
-        debug: false,
-    };
-    let listed = match asc::gui::eval(&session, "classes example").unwrap() {
-        asc::gui::Eval::Output(text) => text,
-        asc::gui::Eval::Quit => panic!("quit"),
-    };
-    assert_eq!(listed, "Lexample/Test;\n");
-    let source = match asc::gui::eval(&session, "open example.Test").unwrap() {
-        asc::gui::Eval::Output(text) => text,
-        asc::gui::Eval::Quit => panic!("quit"),
-    };
-    assert!(source.contains("void first()"), "{source}");
-    let refs = match asc::gui::eval(&session, "find string token").unwrap() {
-        asc::gui::Eval::Output(text) => text,
-        asc::gui::Eval::Quit => panic!("quit"),
-    };
-    assert!(refs.contains("->first"), "{refs}");
-    assert!(matches!(
-        asc::gui::eval(&session, "quit").unwrap(),
-        asc::gui::Eval::Quit
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 fn sample_manifest() -> Vec<u8> {
     // Built by the library test; reconstruct the same bytes the unit test uses
     // by shelling through a tiny encoder kept here so the APK path is covered.

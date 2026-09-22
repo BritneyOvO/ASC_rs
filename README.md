@@ -16,20 +16,9 @@ asc findrefs app.apk type com.poc.Main
 asc findrefs app.apk method onCreate --class com.poc.Main
 asc findrefs app.apk method notify --class MainActivity --fuzzy-class
 asc findrefs app.apk field apiKey
-asc app.apk --gui
 ```
 
 `listclass` 按 DEX 条目和 `class_def` 的顺序输出 Dalvik 描述符，一行一个。`--prefix com.poc` 会规范成 `Lcom/poc`。`findrefs` 的 string/type，以及不带精确类名的 method/field 名字，按正则匹配字符串表（`.` 匹配任意字节，和上游一样）。
-
-`--gui` 打开终端浏览器，而不是原来的 Tk 窗口。命令：
-
-```text
-classes [prefix]
-open <class>
-find string|type|method|field <value> [--class NAME] [--fuzzy-class]
-manifest
-quit
-```
 
 ## 构建
 
@@ -46,7 +35,7 @@ cargo build --release
 - 引用搜索、类列表、DEX 041 容器和 ZIP 中央目录扫描沿用同一套规则：16 字节指令桶、指令边界校验、按需 inflate。
 - `getclass` 用原生字节码提升打印 Java 签名和方法体，不调用 Androguard。类结构、方法签名和常量可以直接读；控制流不会被重构成完整的 Java AST。
 - 多个 DEX 同时命中时，结果按压缩后体积排序，避免多线程完成顺序抖动。
-- 终端界面覆盖列类、反编译、引用搜索和清单。图形界面里的源码回写没有移植。
+- 不提供 GUI。上游 Tk 界面和源码回写都没有移植。
 
 ## 许可
 
