@@ -1,0 +1,14 @@
+[package]
+name = "asc"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Fast Android decompiler front-end for agents and mobile researchers"
+readme = "README.md"
+repository = "https://github.com/MG1937/ASC"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+memmap2 = "0.9"
+regex = "1.11"

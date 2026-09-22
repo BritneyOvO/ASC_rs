@@ -1,0 +1,8 @@
+ASC-rs
+Copyright 2026
+
+This project is a Rust rewrite of ASC by MG1937:
+https://github.com/MG1937/ASC
+
+The original work and this derivative are licensed under the Apache License,
+Version 2.0. See the LICENSE file.
