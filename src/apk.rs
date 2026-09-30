@@ -54,8 +54,10 @@ struct DexEntry {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ClassRank {
-    group: u8,
+    module: u8,
+    kind: u8,
     ordinal: u32,
+    tie: u32,
     logical: u32,
 }
 
@@ -151,7 +153,7 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     if entries.is_empty() {
         return Ok(DumpStats::default());
     }
-    let ranks: Vec<(u8, u32)> = entries.iter().map(load_key).collect();
+    let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
     let errors = run_indexed(entries.len(), options.threads, |index| {
         dump_dex_entry(
@@ -184,15 +186,17 @@ fn dump_dex_entry(
     entry: &DexEntry,
     out_dir: &Path,
     options: &Options,
-    rank_base: (u8, u32),
+    rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
     let mut errors = 0usize;
     for (logical, (_name, buf)) in logical_buffers(&entry.name, data)?.into_iter().enumerate() {
         let rank = ClassRank {
-            group: rank_base.0,
-            ordinal: rank_base.1,
+            module: rank_base.0,
+            kind: rank_base.1,
+            ordinal: rank_base.2,
+            tie: rank_base.3,
             logical: logical as u32,
         };
         let dex = Dex::parse(&buf)?;
@@ -253,8 +257,8 @@ fn publish_class(
         .and_then(|name| name.to_str())
         .unwrap_or("class.java");
     let tmp = dest.with_file_name(format!(
-        ".{file_name}.{}.{}.{}",
-        rank.group, rank.ordinal, rank.logical
+        ".{file_name}.{}.{}.{}.{}.{}",
+        rank.module, rank.kind, rank.ordinal, rank.tie, rank.logical
     ));
     fs::write(&tmp, source)?;
     let mut claims = claims.lock().expect("mutex poisoned");
@@ -268,16 +272,27 @@ fn publish_class(
     Ok(())
 }
 
-fn load_key(entry: &DexEntry) -> (u8, u32) {
+fn load_key(entry: &DexEntry) -> (u8, u8, u32, u32) {
+    let module = module_rank(&entry.name);
     if let Some(ordinal) = classes_ordinal(&entry.name) {
-        (0, ordinal)
+        (module, 0, ordinal, entry.cd_index)
     } else {
-        (1, entry.cd_index)
+        (module, 1, entry.cd_index, 0)
+    }
+}
+
+/// APK root entries and the app bundle's `base` module load before feature modules.
+fn module_rank(name: &str) -> u8 {
+    if !name.contains('/') || name.starts_with("base/") {
+        0
+    } else {
+        1
     }
 }
 
 fn classes_ordinal(name: &str) -> Option<u32> {
-    let stem = name.strip_suffix(".dex")?;
+    let file = name.rsplit('/').next().unwrap_or(name);
+    let stem = file.strip_suffix(".dex")?;
     if stem == "classes" {
         return Some(1);
     }
@@ -596,11 +611,11 @@ fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
             data.len()
         );
     }
-    // Packers often store CRC 0. A recorded CRC is checked against the inflated bytes.
+    // Packers often store CRC 0. A recorded mismatch is reported and the bytes are still used.
     if crc != 0 {
         let actual = crc32fast::hash(&data);
         if actual != crc {
-            bail!("crc mismatch for {name}: stored {crc:08x}, computed {actual:08x}");
+            eprintln!("warning: crc mismatch for {name}: stored {crc:08x}, computed {actual:08x}");
         }
     }
     Ok(data)
@@ -676,7 +691,7 @@ fn parse_cd_dex_entries(apk: &[u8]) -> Result<Vec<DexEntry>> {
 }
 
 fn root_dex(entry: &ZipEntry, cd_index: u32) -> Option<DexEntry> {
-    if !entry.name.ends_with(b".dex") || entry.name.contains(&b'/') {
+    if !is_code_dex(&entry.name) {
         return None;
     }
     Some(DexEntry {
@@ -688,6 +703,19 @@ fn root_dex(entry: &ZipEntry, cd_index: u32) -> Option<DexEntry> {
         crc: entry.crc,
         cd_index,
     })
+}
+
+/// APK dex files sit at the archive root. App bundles keep them in `<module>/dex/`.
+fn is_code_dex(name: &[u8]) -> bool {
+    let Some(slash) = name.iter().rposition(|byte| *byte == b'/') else {
+        return name.ends_with(b".dex");
+    };
+    let file = &name[slash + 1..];
+    if file == b".dex" || !file.ends_with(b".dex") {
+        return false;
+    }
+    let parent = &name[..slash];
+    parent == b"dex" || parent.ends_with(b"/dex")
 }
 
 fn append_classes_heuristic(
@@ -891,23 +919,51 @@ fn zip64_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
 
 fn read_zip_entry(apk: &[u8], wanted: &str) -> Result<Vec<u8>> {
     let (cd_off, cd_end) = cd_bounds(apk)?;
-    let wanted_bytes = wanted.as_bytes();
+    let mut chosen: Option<(u8, ZipEntry)> = None;
     for entry in walk_central_directory(apk, cd_off, cd_end)? {
-        if entry.name.as_slice() == wanted_bytes {
-            return inflate_bytes(
-                apk,
-                ZipBytes {
-                    name: wanted,
-                    method: entry.method,
-                    crc: entry.crc,
-                    compressed_size: entry.comp_size,
-                    uncompressed_size: entry.uncomp_size,
-                    header_offset: entry.local_header_off,
-                },
-            );
+        let Some(rank) = manifest_rank(&entry.name, wanted.as_bytes()) else {
+            continue;
+        };
+        let replace = chosen
+            .as_ref()
+            .map(|(prev, _)| rank < *prev)
+            .unwrap_or(true);
+        if replace {
+            chosen = Some((rank, entry));
         }
     }
-    bail!("AndroidManifest.xml not found in APK");
+    let Some((_, entry)) = chosen else {
+        bail!("AndroidManifest.xml not found");
+    };
+    let name = String::from_utf8_lossy(&entry.name).into_owned();
+    inflate_bytes(
+        apk,
+        ZipBytes {
+            name: &name,
+            method: entry.method,
+            crc: entry.crc,
+            compressed_size: entry.comp_size,
+            uncompressed_size: entry.uncomp_size,
+            header_offset: entry.local_header_off,
+        },
+    )
+}
+
+fn manifest_rank(name: &[u8], wanted: &[u8]) -> Option<u8> {
+    if name == wanted {
+        return Some(0);
+    }
+    if wanted != b"AndroidManifest.xml" {
+        return None;
+    }
+    if name == b"base/manifest/AndroidManifest.xml" {
+        return Some(1);
+    }
+    if name.ends_with(b"/manifest/AndroidManifest.xml") {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 fn find_eocd(apk: &[u8]) -> Option<usize> {

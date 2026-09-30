@@ -1,7 +1,9 @@
 use std::process::Command;
 
 use asc::findrefs::{find_in_dex, MemberSel, RefQuery};
-use asc::{decompile_class, dump_apk, get_class_source, list_classes, manifest_xml, Options};
+use asc::{
+    decompile_class, dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options,
+};
 
 #[path = "support.rs"]
 mod support;
@@ -486,8 +488,81 @@ fn zip64_data_descriptor_and_crc_are_honored() {
         support::zip_stored_flags("classes.dex", &dex, 0x00de_adbe, 0),
     )
     .unwrap();
-    let err = list_classes(&bad, None, &opts(1)).unwrap_err();
-    assert!(err.to_string().contains("crc mismatch"), "{err}");
+    assert_eq!(
+        list_classes(&bad, None, &opts(1)).unwrap(),
+        vec!["Lcom/app/Main;".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn aab_reads_module_dex_and_base_manifest() {
+    let base = support::make_class_only_dex(&["Lcom/app/Base;"], 0, b"035");
+    let feature = support::make_class_only_dex(&["Lcom/app/Feature;"], 0, b"035");
+    let hidden = support::make_class_only_dex(&["Lcom/app/Hidden;"], 0, b"035");
+    let manifest = sample_manifest();
+    let dir = std::env::temp_dir().join(format!("asc-aab-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let aab = write_apk(
+        &dir,
+        "app.aab",
+        &[
+            ("base/manifest/AndroidManifest.xml", manifest.as_slice()),
+            ("base/dex/classes.dex", base.as_slice()),
+            ("feature/dex/classes.dex", feature.as_slice()),
+            ("base/assets/classes.dex", hidden.as_slice()),
+        ],
+        false,
+    );
+    assert_eq!(
+        list_classes(&aab, None, &opts(2)).unwrap(),
+        vec![
+            "Lcom/app/Base;".to_string(),
+            "Lcom/app/Feature;".to_string()
+        ]
+    );
+    let xml = manifest_xml(&aab).unwrap();
+    assert!(xml.contains("package=\"com.example\""), "{xml}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn aab_duplicate_class_prefers_base_then_classes_ordinal() {
+    let base = support::make_marked_dex(b"from-base-module!");
+    let feature = support::make_marked_dex(b"from-feature-mod");
+    let early = support::make_marked_dex(b"from-classes2-longer");
+    let later = support::make_marked_dex(b"short");
+    let dir = std::env::temp_dir().join(format!("asc-aab-dup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let aab = write_apk(
+        &dir,
+        "dup.aab",
+        &[
+            ("feature/dex/classes.dex", feature.as_slice()),
+            ("base/dex/classes.dex", base.as_slice()),
+        ],
+        false,
+    );
+    let source = get_class_source(&aab, "example.Test", &opts(4)).unwrap();
+    assert!(source.contains("from-base-module!"), "{source}");
+    assert!(!source.contains("from-feature-mod"), "{source}");
+    let lines = find_refs(&aab, &RefQuery::String("from-feature-mod".into()), &opts(2)).unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("from-feature-mod")),
+        "{lines:?}"
+    );
+    let ordered = write_apk(
+        &dir,
+        "order.aab",
+        &[
+            ("base/dex/classes10.dex", later.as_slice()),
+            ("base/dex/classes2.dex", early.as_slice()),
+        ],
+        false,
+    );
+    let source = get_class_source(&ordered, "example.Test", &opts(2)).unwrap();
+    assert!(source.contains("from-classes2-longer"), "{source}");
+    assert!(!source.contains("\"short\""), "{source}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -20,7 +20,7 @@ asc findrefs app.apk field apiKey
 
 `listclass` 按 DEX 条目和 `class_def` 的顺序输出 Dalvik 描述符，一行一个。`--prefix com.poc` 会规范成 `Lcom/poc`。`findrefs` 的 string/type 在每条字符串内容上做正则搜索（`.` 匹配任意字节，可以命中字符串中间）。不带 `--class` 的 method/field 名字必须匹配整个简单名；带精确 `--class` 时名字按字面量完全相等。`--fuzzy-class` 的类名仍是子串正则。
 
-同名类在 `getclass` 和 `dump` 里按运行时顺序保留：`classes.dex`、`classes2.dex`、`classes10.dex`，其余根目录 DEX 按中央目录顺序排在后面。ZIP 读取支持 store、deflate、数据描述符和 ZIP64。中央目录里的 CRC 非 0 时会校验解压结果；CRC 为 0 的条目仍然读取。
+同名类在 `getclass` 和 `dump` 里按运行时顺序保留：`classes.dex`、`classes2.dex`、`classes10.dex`，其余根目录 DEX 按中央目录顺序排在后面。Android App Bundle 里的代码在 `<module>/dex/*.dex`，清单在 `base/manifest/AndroidManifest.xml`（aapt2 protobuf XML）；同名类先保留 `base` 模块，再保留其它模块。ZIP 读取支持 store、deflate、数据描述符和 ZIP64。中央目录里的 CRC 非 0 时会核对解压结果，不一致时在标准错误告警并继续读取；CRC 为 0 的条目不核对。
 
 ## 构建
 

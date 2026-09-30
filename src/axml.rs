@@ -1,9 +1,16 @@
-//! Android binary XML decoder, enough to print AndroidManifest.xml.
+//! Android manifest decoder for binary XML and app-bundle protobuf XML.
 
 use crate::bytes::{u16_at, u32_at};
 use crate::Result;
 
 pub fn manifest_xml(data: &[u8]) -> Result<String> {
+    if data.len() >= 8 && u16_at(data, 0)? == 0x0003 {
+        return binary_manifest_xml(data);
+    }
+    proto_manifest_xml(data)
+}
+
+fn binary_manifest_xml(data: &[u8]) -> Result<String> {
     if data.len() < 8 {
         bail!("AndroidManifest.xml is not a valid binary XML");
     }
@@ -301,6 +308,407 @@ fn xml_escape(value: &str) -> String {
     out
 }
 
+const ANDROID_NS: &str = "http://schemas.android.com/apk/res/android";
+
+fn proto_manifest_xml(data: &[u8]) -> Result<String> {
+    let node = parse_xml_node(data)?;
+    let Some(element) = node.element else {
+        bail!("AndroidManifest.xml is not a valid protobuf XML");
+    };
+    let root = element_to_node(&element, &[]);
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    write_node(&mut out, &root, 0);
+    Ok(out)
+}
+
+fn element_to_node(element: &ProtoElement, inherited: &[(String, String)]) -> Node {
+    let mut prefixes = inherited.to_vec();
+    let mut attrs = Vec::new();
+    for (prefix, uri) in &element.namespaces {
+        let key = if prefix.is_empty() {
+            "xmlns".to_string()
+        } else {
+            format!("xmlns:{prefix}")
+        };
+        attrs.push((key, xml_escape(uri)));
+        prefixes.push((prefix.clone(), uri.clone()));
+    }
+    for attr in &element.attributes {
+        let key = qualify_name(&prefixes, &attr.namespace_uri, &attr.name);
+        let raw = if attr.value.is_empty() {
+            attr.compiled.clone()
+        } else {
+            attr.value.clone()
+        };
+        attrs.push((key, xml_escape(&raw)));
+    }
+    let mut node = Node {
+        name: qualify_name(&prefixes, &element.namespace_uri, &element.name),
+        attrs,
+        children: Vec::new(),
+        text: String::new(),
+    };
+    for child in &element.children {
+        if let Some(text) = &child.text {
+            if text.chars().any(|ch| !ch.is_whitespace()) {
+                if !node.text.is_empty() {
+                    node.text.push(' ');
+                }
+                node.text.push_str(text);
+            }
+        }
+        if let Some(inner) = &child.element {
+            node.children.push(element_to_node(inner, &prefixes));
+        }
+    }
+    node
+}
+
+fn qualify_name(prefixes: &[(String, String)], namespace_uri: &str, name: &str) -> String {
+    if namespace_uri.is_empty() {
+        return name.to_string();
+    }
+    let prefix = prefixes
+        .iter()
+        .rev()
+        .find(|(_, uri)| uri == namespace_uri)
+        .map(|(prefix, _)| prefix.as_str())
+        .unwrap_or(if namespace_uri == ANDROID_NS {
+            "android"
+        } else {
+            ""
+        });
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}:{name}")
+    }
+}
+
+struct ProtoNode {
+    element: Option<ProtoElement>,
+    text: Option<String>,
+}
+
+struct ProtoElement {
+    namespaces: Vec<(String, String)>,
+    namespace_uri: String,
+    name: String,
+    attributes: Vec<ProtoAttr>,
+    children: Vec<ProtoNode>,
+}
+
+struct ProtoAttr {
+    namespace_uri: String,
+    name: String,
+    value: String,
+    compiled: String,
+}
+
+fn parse_xml_node(data: &[u8]) -> Result<ProtoNode> {
+    let mut node = ProtoNode {
+        element: None,
+        text: None,
+    };
+    let mut cursor = Cursor::new(data);
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => node.element = Some(parse_xml_element(cursor.read_bytes()?)?),
+            (2, 2) => node.text = Some(cursor.read_string()?),
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok(node)
+}
+
+fn parse_xml_element(data: &[u8]) -> Result<ProtoElement> {
+    let mut element = ProtoElement {
+        namespaces: Vec::new(),
+        namespace_uri: String::new(),
+        name: String::new(),
+        attributes: Vec::new(),
+        children: Vec::new(),
+    };
+    let mut cursor = Cursor::new(data);
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => element
+                .namespaces
+                .push(parse_namespace(cursor.read_bytes()?)?),
+            (2, 2) => element.namespace_uri = cursor.read_string()?,
+            (3, 2) => element.name = cursor.read_string()?,
+            (4, 2) => element
+                .attributes
+                .push(parse_attribute(cursor.read_bytes()?)?),
+            (5, 2) => element.children.push(parse_xml_node(cursor.read_bytes()?)?),
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    if element.name.is_empty() {
+        bail!("AndroidManifest.xml is not a valid protobuf XML");
+    }
+    Ok(element)
+}
+
+fn parse_namespace(data: &[u8]) -> Result<(String, String)> {
+    let mut prefix = String::new();
+    let mut uri = String::new();
+    let mut cursor = Cursor::new(data);
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => prefix = cursor.read_string()?,
+            (2, 2) => uri = cursor.read_string()?,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok((prefix, uri))
+}
+
+fn parse_attribute(data: &[u8]) -> Result<ProtoAttr> {
+    let mut attr = ProtoAttr {
+        namespace_uri: String::new(),
+        name: String::new(),
+        value: String::new(),
+        compiled: String::new(),
+    };
+    let mut cursor = Cursor::new(data);
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => attr.namespace_uri = cursor.read_string()?,
+            (2, 2) => attr.name = cursor.read_string()?,
+            (3, 2) => attr.value = cursor.read_string()?,
+            (6, 2) => attr.compiled = format_item(cursor.read_bytes()?)?,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok(attr)
+}
+
+fn format_item(data: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(data);
+    let mut rendered = String::new();
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => rendered = format_reference(cursor.read_bytes()?)?,
+            (2, 2) | (3, 2) => rendered = format_wrapped_string(cursor.read_bytes()?)?,
+            (4, 2) => rendered = format_styled_string(cursor.read_bytes()?)?,
+            (5, 2) => rendered = format_file_reference(cursor.read_bytes()?)?,
+            (6, 2) => {
+                cursor.skip(2)?;
+            }
+            (7, 2) => rendered = format_primitive(cursor.read_bytes()?)?,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok(rendered)
+}
+
+fn format_wrapped_string(data: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(data);
+    let mut value = String::new();
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => value = cursor.read_string()?,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok(value)
+}
+
+fn format_styled_string(data: &[u8]) -> Result<String> {
+    format_wrapped_string(data)
+}
+
+fn format_file_reference(data: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(data);
+    let mut path = String::new();
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 2) => path = cursor.read_string()?,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    Ok(path)
+}
+
+fn format_reference(data: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(data);
+    let mut kind = 0u64;
+    let mut id = 0u64;
+    let mut name = String::new();
+    let mut private = false;
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        match (field, wire) {
+            (1, 0) => kind = cursor.read_varint()?,
+            (2, 0) => id = cursor.read_varint()?,
+            (3, 2) => name = cursor.read_string()?,
+            (4, 0) => private = cursor.read_varint()? != 0,
+            (_, wire) => cursor.skip(wire)?,
+        }
+    }
+    if name.starts_with('@') || name.starts_with('?') {
+        return Ok(name);
+    }
+    let sigil = if kind == 1 { "?" } else { "@" };
+    let star = if private { "*" } else { "" };
+    if !name.is_empty() {
+        return Ok(format!("{sigil}{star}{name}"));
+    }
+    if id != 0 {
+        return Ok(format!("{sigil}{star}{id:#x}"));
+    }
+    Ok(String::new())
+}
+
+fn format_primitive(data: &[u8]) -> Result<String> {
+    let mut cursor = Cursor::new(data);
+    let mut rendered = String::new();
+    while cursor.remaining() {
+        let (field, wire) = cursor.read_key()?;
+        rendered = match (field, wire) {
+            (1, 2) | (2, 2) => {
+                cursor.skip(2)?;
+                String::new()
+            }
+            (3, 5) => f32::from_bits(cursor.read_fixed32()?).to_string(),
+            (6, 0) => {
+                let bits = u32::try_from(cursor.read_varint()? & 0xffff_ffff).unwrap_or(u32::MAX);
+                i32::from_le_bytes(bits.to_le_bytes()).to_string()
+            }
+            (7, 0) => format!("{:#x}", cursor.read_varint()?),
+            (8, 0) => {
+                if cursor.read_varint()? == 0 {
+                    "false".to_string()
+                } else {
+                    "true".to_string()
+                }
+            }
+            (9, 0) => format!("#{:08x}", cursor.read_varint()?),
+            (10, 0) => format!("#{:06x}", cursor.read_varint()? & 0x00ff_ffff),
+            (11, 0) => format!("#{:04x}", cursor.read_varint()? & 0xffff),
+            (12, 0) => format!("#{:03x}", cursor.read_varint()? & 0x0fff),
+            (_, wire) => {
+                cursor.skip(wire)?;
+                rendered
+            }
+        };
+    }
+    Ok(rendered)
+}
+
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> bool {
+        self.pos < self.data.len()
+    }
+
+    fn read_key(&mut self) -> Result<(u32, u32)> {
+        let key = self.read_varint()?;
+        let field = u32::try_from(key >> 3).unwrap_or(u32::MAX);
+        Ok((field, (key & 7) as u32))
+    }
+
+    fn read_varint(&mut self) -> Result<u64> {
+        let mut result = 0u64;
+        let mut shift = 0;
+        for _ in 0..10 {
+            let byte = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| crate::Error::new("truncated protobuf"))?;
+            self.pos += 1;
+            let piece = u64::from(byte & 0x7f);
+            if shift == 63 && piece > 1 {
+                bail!("protobuf varint is too long");
+            }
+            result |= piece << shift;
+            if byte < 0x80 {
+                return Ok(result);
+            }
+            shift += 7;
+        }
+        bail!("protobuf varint is too long");
+    }
+
+    fn read_bytes(&mut self) -> Result<&'a [u8]> {
+        let len = usize::try_from(self.read_varint()?)
+            .map_err(|_| crate::Error::new("protobuf length is too large"))?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| crate::Error::new("truncated protobuf"))?;
+        if end > self.data.len() {
+            bail!("truncated protobuf");
+        }
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn read_string(&mut self) -> Result<String> {
+        let bytes = self.read_bytes()?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| crate::Error::new("protobuf string is not utf-8"))
+    }
+
+    fn read_fixed32(&mut self) -> Result<u32> {
+        let end = self
+            .pos
+            .checked_add(4)
+            .ok_or_else(|| crate::Error::new("truncated protobuf"))?;
+        if end > self.data.len() {
+            bail!("truncated protobuf");
+        }
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(&self.data[self.pos..end]);
+        self.pos = end;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn skip(&mut self, wire: u32) -> Result<()> {
+        match wire {
+            0 => {
+                self.read_varint()?;
+            }
+            1 => self.advance(8)?,
+            2 => {
+                self.read_bytes()?;
+            }
+            5 => self.advance(4)?,
+            _ => bail!("unsupported protobuf wire type {wire}"),
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, len: usize) -> Result<()> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| crate::Error::new("truncated protobuf"))?;
+        if end > self.data.len() {
+            bail!("truncated protobuf");
+        }
+        self.pos = end;
+        Ok(())
+    }
+}
+
 fn write_node(out: &mut String, node: &Node, indent: usize) {
     let pad = "    ".repeat(indent);
     out.push_str(&pad);
@@ -491,5 +899,73 @@ mod tests {
         let xml = manifest_xml(&file).unwrap();
         assert!(xml.contains("A&amp;B"), "{xml}");
         assert!(!xml.contains("A&amp;amp;B"), "{xml}");
+    }
+
+    fn proto_bytes(field: u32, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let key = u64::from(field) << 3 | 2;
+        write_varint(&mut out, key);
+        write_varint(&mut out, value.len() as u64);
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn proto_str(field: u32, value: &str) -> Vec<u8> {
+        proto_bytes(field, value.as_bytes())
+    }
+
+    fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn decodes_protobuf_manifest() {
+        let mut namespace = proto_str(1, "android");
+        namespace.extend(proto_str(2, "http://schemas.android.com/apk/res/android"));
+        let mut package = proto_str(2, "package");
+        package.extend(proto_str(3, "com.example"));
+        let reference = proto_str(3, "mipmap/ic_launcher");
+        let icon_item = proto_bytes(1, &reference);
+        let mut icon = proto_str(1, "http://schemas.android.com/apk/res/android");
+        icon.extend(proto_str(2, "icon"));
+        icon.extend(proto_bytes(6, &icon_item));
+        let mut boolean = Vec::new();
+        write_varint(&mut boolean, 8 << 3);
+        write_varint(&mut boolean, 1);
+        let primitive = proto_bytes(7, &boolean);
+        let mut backup = proto_str(1, "http://schemas.android.com/apk/res/android");
+        backup.extend(proto_str(2, "allowBackup"));
+        backup.extend(proto_bytes(6, &primitive));
+        let mut application = proto_str(3, "application");
+        application.extend(proto_bytes(4, &icon));
+        application.extend(proto_bytes(4, &backup));
+        let application = proto_bytes(1, &application);
+        let mut manifest = proto_bytes(1, &namespace);
+        manifest.extend(proto_str(3, "manifest"));
+        manifest.extend(proto_bytes(4, &package));
+        manifest.extend(proto_bytes(5, &application));
+        let root = proto_bytes(1, &manifest);
+        let xml = manifest_xml(&root).unwrap();
+        assert!(
+            xml.contains("xmlns:android=\"http://schemas.android.com/apk/res/android\""),
+            "{xml}"
+        );
+        assert!(xml.contains("package=\"com.example\""), "{xml}");
+        assert!(
+            xml.contains("android:icon=\"@mipmap/ic_launcher\""),
+            "{xml}"
+        );
+        assert!(xml.contains("android:allowBackup=\"true\""), "{xml}");
+        assert!(xml.contains("<application"), "{xml}");
     }
 }
