@@ -106,6 +106,19 @@ fn parse_string_pool(chunk: &[u8]) -> Result<Vec<String>> {
     let count = u32_at(chunk, 8)? as usize;
     let flags = u32_at(chunk, 16)?;
     let strings_start = u32_at(chunk, 20)? as usize;
+    if header_size < 28 || header_size > chunk.len() {
+        bail!("truncated string pool");
+    }
+    let index_bytes = count
+        .checked_mul(4)
+        .ok_or_else(|| crate::Error::new("string pool is too large"))?;
+    if header_size
+        .checked_add(index_bytes)
+        .map(|end| end > chunk.len())
+        .unwrap_or(true)
+    {
+        bail!("truncated string pool");
+    }
     let utf8 = flags & (1 << 8) != 0;
     let mut strings = Vec::with_capacity(count);
     for index in 0..count {
@@ -157,6 +170,10 @@ fn read_utf16(data: &[u8], off: usize) -> Result<String> {
         (usize::from(first), 2)
     };
     let start = off + skip;
+    let available = data.len().saturating_sub(start) / 2;
+    if chars > available {
+        bail!("truncated string pool");
+    }
     let mut units = Vec::with_capacity(chars);
     for index in 0..chars {
         units.push(u16_at(data, start + index * 2)?);
@@ -225,7 +242,7 @@ fn read_cdata(chunk: &[u8], pool: &[String]) -> Option<String> {
     if raw == 0xffff_ffff {
         return None;
     }
-    Some(xml_escape(&pool_get(pool, raw)))
+    Some(pool_get(pool, raw))
 }
 
 fn qualified(pool: &[String], ns: u32, name: u32, namespaces: &[(String, String)]) -> String {
@@ -446,5 +463,33 @@ mod tests {
             xml.contains("xmlns:android=\"http://schemas.android.com/apk/res/android\""),
             "{xml}"
         );
+    }
+
+    fn cdata(raw: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_u16(&mut buf, 0x0104);
+        push_u16(&mut buf, 16);
+        push_u32(&mut buf, 28);
+        push_u32(&mut buf, 1);
+        push_u32(&mut buf, 0xffff_ffff);
+        push_u32(&mut buf, raw);
+        buf
+    }
+
+    #[test]
+    fn text_nodes_are_escaped_once() {
+        let strings = ["manifest", "A&B"];
+        let mut body = encode_pool(&strings);
+        body.extend(element(0xffff_ffff, 0, &[]));
+        body.extend(cdata(1));
+        body.extend(end_element(0xffff_ffff, 0));
+        let mut file = Vec::new();
+        push_u16(&mut file, 0x0003);
+        push_u16(&mut file, 8);
+        push_u32(&mut file, (8 + body.len()) as u32);
+        file.extend(body);
+        let xml = manifest_xml(&file).unwrap();
+        assert!(xml.contains("A&amp;B"), "{xml}");
+        assert!(!xml.contains("A&amp;amp;B"), "{xml}");
     }
 }

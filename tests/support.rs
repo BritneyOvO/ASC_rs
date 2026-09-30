@@ -103,13 +103,17 @@ fn put_u16s_u32(buf: &mut [u8], off: usize, class_idx: u16, mid: u16, name: u32)
 }
 
 pub fn make_dex() -> Vec<u8> {
+    make_marked_dex(b"token")
+}
+
+pub fn make_marked_dex(token: &[u8]) -> Vec<u8> {
     let strings: [&[u8]; 6] = [
         b"Lexample/Test;",
         b"Ljava/lang/Object;",
         b"V",
         b"first",
         b"second",
-        b"token",
+        token,
     ];
     let mut builder = DexBuilder::new();
     let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
@@ -251,13 +255,17 @@ pub fn make_invoke_dex() -> Vec<u8> {
 }
 
 pub fn make_field_dex() -> Vec<u8> {
+    make_field_named_dex(b"a")
+}
+
+pub fn make_field_named_dex(field: &[u8]) -> Vec<u8> {
     let strings: [&[u8]; 6] = [
         b"Lexample/Test;",
         b"Ljava/lang/Object;",
         b"Lexample/Target;",
         b"L",
         b"getA",
-        b"a",
+        field,
     ];
     let mut builder = DexBuilder::new();
     let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
@@ -391,6 +399,7 @@ pub fn zip_archive(files: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
         } else {
             (0u16, data.to_vec())
         };
+        let crc = crc32fast::hash(data);
         let mut local = Vec::new();
         local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
         local.extend_from_slice(&20u16.to_le_bytes());
@@ -398,7 +407,7 @@ pub fn zip_archive(files: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
         local.extend_from_slice(&method.to_le_bytes());
         local.extend_from_slice(&0u16.to_le_bytes());
         local.extend_from_slice(&0u16.to_le_bytes());
-        local.extend_from_slice(&0u32.to_le_bytes());
+        local.extend_from_slice(&crc.to_le_bytes());
         local.extend_from_slice(&(comp.len() as u32).to_le_bytes());
         local.extend_from_slice(&(data.len() as u32).to_le_bytes());
         local.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
@@ -414,7 +423,7 @@ pub fn zip_archive(files: &[(&str, &[u8])], deflate: bool) -> Vec<u8> {
         cd.extend_from_slice(&method.to_le_bytes());
         cd.extend_from_slice(&0u16.to_le_bytes());
         cd.extend_from_slice(&0u16.to_le_bytes());
-        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&crc.to_le_bytes());
         cd.extend_from_slice(&(comp.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(data.len() as u32).to_le_bytes());
         cd.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
@@ -448,4 +457,390 @@ fn deflate_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).unwrap();
     encoder.finish().unwrap()
+}
+
+fn code_item(insns: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&((insns.len() / 2) as u32).to_le_bytes());
+    body.extend_from_slice(insns);
+    body
+}
+
+fn one_method_dex(strings: &[&[u8]], method_name: u32, insns: &[u8]) -> Vec<u8> {
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
+    let type_ids = builder.section(2, 3, &pack_u32s(&[0, 1, 2]), 4);
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[2, 2, 0]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, method_name);
+    let method_ids = builder.section(5, 1, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    write_string_payload(&mut builder, string_ids, strings);
+    let code = builder.section(0x2001, 1, &code_item(insns), 4);
+    let mut class_data = vec![0, 0, 1, 0, 0, 0x09];
+    class_data.extend(uleb(code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    builder.finish(
+        strings.len(),
+        string_ids,
+        3,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        1,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
+pub fn make_payload_dex(kind: u8) -> Vec<u8> {
+    let payload: [u8; 12] = match kind {
+        1 => [0x00, 0x01, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+        2 => [0x00, 0x02, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+        _ => [0x00, 0x03, 0x04, 0x00, 0x01, 0, 0, 0, 1, 2, 3, 4],
+    };
+    let mut insns = payload.to_vec();
+    insns.extend_from_slice(&[0x1a, 0x00, 0x03, 0x00, 0x0e, 0x00]);
+    one_method_dex(
+        &[
+            b"Lexample/Test;",
+            b"Ljava/lang/Object;",
+            b"V",
+            b"token",
+            b"after",
+        ],
+        4,
+        &insns,
+    )
+}
+
+pub fn make_reordered_string_dex() -> Vec<u8> {
+    let strings: [&[u8]; 5] = [
+        b"Lexample/Test;",
+        b"Ljava/lang/Object;",
+        b"V",
+        b"mytoken",
+        b"m",
+    ];
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
+    let type_ids = builder.section(2, 3, &pack_u32s(&[0, 1, 2]), 4);
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[2, 2, 0]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, 4);
+    let method_ids = builder.section(5, 1, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    let physical = [3usize, 0, 1, 2, 4];
+    let mut blob = Vec::new();
+    let mut relative = vec![0u32; strings.len()];
+    for index in physical {
+        relative[index] = blob.len() as u32;
+        blob.extend(uleb(strings[index].len()));
+        blob.extend_from_slice(strings[index]);
+        blob.push(0);
+    }
+    let start = builder.section(0x2002, strings.len() as u32, &blob, 1);
+    for (index, offset) in relative.iter().enumerate() {
+        put_u32(
+            &mut builder.buf,
+            string_ids + index * 4,
+            start as u32 + offset,
+        );
+    }
+    let code = builder.section(
+        0x2001,
+        1,
+        &code_item(&[0x1a, 0x00, 0x03, 0x00, 0x0e, 0x00]),
+        4,
+    );
+    let mut class_data = vec![0, 0, 1, 0, 0, 0x09];
+    class_data.extend(uleb(code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    builder.finish(
+        strings.len(),
+        string_ids,
+        3,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        1,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
+pub fn make_bucket_overlap_dex() -> Vec<u8> {
+    let strings: [&[u8]; 6] = [
+        b"Lexample/Test;",
+        b"Ljava/lang/Object;",
+        b"V",
+        b"kept",
+        b"wide",
+        b"token",
+    ];
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &[0; 24], 4);
+    let type_ids = builder.section(2, 3, &pack_u32s(&[0, 1, 2]), 4);
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[2, 2, 0]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, 3);
+    put_method(&mut methods, 0, 0, 4);
+    let method_ids = builder.section(5, 2, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    write_string_payload(&mut builder, string_ids, &strings);
+    let wide_code = builder.section(0x2001, 1, &code_item(&[0x00, 0x00, 0x00, 0x00]), 4);
+    let kept_code = builder.section(
+        0x2001,
+        1,
+        &code_item(&[0x1a, 0x00, 0x05, 0x00, 0x0e, 0x00]),
+        4,
+    );
+    let covered = (builder.buf.len() - (wide_code + 16)) / 2;
+    put_u32(&mut builder.buf, wide_code + 12, covered as u32);
+    let mut class_data = vec![0, 0, 2, 0];
+    class_data.extend_from_slice(&[0x00, 0x09]);
+    class_data.extend(uleb(kept_code));
+    class_data.extend_from_slice(&[0x01, 0x09]);
+    class_data.extend(uleb(wide_code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    builder.finish(
+        strings.len(),
+        string_ids,
+        3,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        2,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
+pub fn make_array_dex() -> Vec<u8> {
+    let strings: [&[u8]; 5] = [
+        b"Lexample/Test;",
+        b"Ljava/lang/Object;",
+        b"V",
+        b"[[I",
+        b"run",
+    ];
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &[0; 20], 4);
+    let type_ids = builder.section(2, 4, &pack_u32s(&[0, 1, 2, 3]), 4);
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[2, 2, 0]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, 4);
+    let method_ids = builder.section(5, 1, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    write_string_payload(&mut builder, string_ids, &strings);
+    let code = builder.section(
+        0x2001,
+        1,
+        &code_item(&[0x23, 0x10, 0x03, 0x00, 0x0e, 0x00]),
+        4,
+    );
+    let mut class_data = vec![0, 0, 1, 0, 0, 0x09];
+    class_data.extend(uleb(code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    builder.finish(
+        strings.len(),
+        string_ids,
+        4,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        1,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
+fn push_u16(buf: &mut Vec<u8>, value: u16) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+pub fn zip_stored_flags(name: &str, data: &[u8], crc: u32, flags: u16) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let descriptor = flags & 0x0008 != 0;
+    let mut local = Vec::new();
+    push_u32(&mut local, 0x0403_4b50);
+    push_u16(&mut local, 20);
+    push_u16(&mut local, flags);
+    push_u16(&mut local, 0);
+    push_u16(&mut local, 0);
+    push_u16(&mut local, 0);
+    push_u32(&mut local, if descriptor { 0 } else { crc });
+    push_u32(&mut local, if descriptor { 0 } else { data.len() as u32 });
+    push_u32(&mut local, if descriptor { 0 } else { data.len() as u32 });
+    push_u16(&mut local, name_bytes.len() as u16);
+    push_u16(&mut local, 0);
+    local.extend_from_slice(name_bytes);
+    local.extend_from_slice(data);
+    if descriptor {
+        push_u32(&mut local, 0x0807_4b50);
+        push_u32(&mut local, crc);
+        push_u32(&mut local, data.len() as u32);
+        push_u32(&mut local, data.len() as u32);
+    }
+    let mut cd = Vec::new();
+    push_u32(&mut cd, 0x0201_4b50);
+    push_u16(&mut cd, 20);
+    push_u16(&mut cd, 20);
+    push_u16(&mut cd, flags);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u32(&mut cd, crc);
+    push_u32(&mut cd, data.len() as u32);
+    push_u32(&mut cd, data.len() as u32);
+    push_u16(&mut cd, name_bytes.len() as u16);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u32(&mut cd, 0);
+    push_u32(&mut cd, 0);
+    cd.extend_from_slice(name_bytes);
+    let cd_off = local.len() as u32;
+    let cd_size = cd.len() as u32;
+    let mut out = local;
+    out.extend(cd);
+    push_u32(&mut out, 0x0605_4b50);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 1);
+    push_u16(&mut out, 1);
+    push_u32(&mut out, cd_size);
+    push_u32(&mut out, cd_off);
+    push_u16(&mut out, 0);
+    out
+}
+
+pub fn zip64_stored(name: &str, data: &[u8]) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let crc = crc32fast::hash(data);
+    let mut local = Vec::new();
+    push_u32(&mut local, 0x0403_4b50);
+    push_u16(&mut local, 20);
+    push_u16(&mut local, 0);
+    push_u16(&mut local, 0);
+    push_u16(&mut local, 0);
+    push_u16(&mut local, 0);
+    push_u32(&mut local, crc);
+    push_u32(&mut local, data.len() as u32);
+    push_u32(&mut local, data.len() as u32);
+    push_u16(&mut local, name_bytes.len() as u16);
+    push_u16(&mut local, 0);
+    local.extend_from_slice(name_bytes);
+    local.extend_from_slice(data);
+
+    let mut extra = Vec::new();
+    push_u16(&mut extra, 0x0001);
+    push_u16(&mut extra, 24);
+    push_u64(&mut extra, data.len() as u64);
+    push_u64(&mut extra, data.len() as u64);
+    push_u64(&mut extra, 0);
+
+    let mut cd = Vec::new();
+    push_u32(&mut cd, 0x0201_4b50);
+    push_u16(&mut cd, 45);
+    push_u16(&mut cd, 45);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u32(&mut cd, crc);
+    push_u32(&mut cd, 0xffff_ffff);
+    push_u32(&mut cd, 0xffff_ffff);
+    push_u16(&mut cd, name_bytes.len() as u16);
+    push_u16(&mut cd, extra.len() as u16);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u16(&mut cd, 0);
+    push_u32(&mut cd, 0);
+    push_u32(&mut cd, 0xffff_ffff);
+    cd.extend_from_slice(name_bytes);
+    cd.extend_from_slice(&extra);
+
+    let cd_off = local.len() as u64;
+    let cd_size = cd.len() as u64;
+    let mut out = local;
+    out.extend_from_slice(&cd);
+    let eocd64_off = out.len() as u64;
+    push_u32(&mut out, 0x0606_4b50);
+    push_u64(&mut out, 44);
+    push_u16(&mut out, 45);
+    push_u16(&mut out, 45);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u64(&mut out, 1);
+    push_u64(&mut out, 1);
+    push_u64(&mut out, cd_size);
+    push_u64(&mut out, cd_off);
+    push_u32(&mut out, 0x0706_4b50);
+    push_u32(&mut out, 0);
+    push_u64(&mut out, eocd64_off);
+    push_u32(&mut out, 1);
+    push_u32(&mut out, 0x0605_4b50);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0);
+    push_u16(&mut out, 0xffff);
+    push_u16(&mut out, 0xffff);
+    push_u32(&mut out, 0xffff_ffff);
+    push_u32(&mut out, 0xffff_ffff);
+    push_u16(&mut out, 0);
+    out
 }

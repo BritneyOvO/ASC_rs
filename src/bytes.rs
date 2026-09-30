@@ -14,6 +14,15 @@ pub fn u32_at(data: &[u8], off: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
+pub fn u64_at(data: &[u8], off: usize) -> Result<u64> {
+    let bytes = data
+        .get(off..off + 8)
+        .ok_or_else(|| crate::Error::new(format!("truncated read at {off:#x}")))?;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(buf))
+}
+
 pub fn read_uleb(data: &[u8], pos: usize) -> Result<(u32, usize)> {
     let mut result: u32 = 0;
     let mut shift = 0;
@@ -21,7 +30,11 @@ pub fn read_uleb(data: &[u8], pos: usize) -> Result<(u32, usize)> {
         let byte = *data
             .get(pos + i)
             .ok_or_else(|| crate::Error::new("truncated uleb128"))?;
-        result |= u32::from(byte & 0x7f) << shift;
+        let piece = u32::from(byte & 0x7f);
+        if piece > (u32::MAX >> shift) {
+            bail!("uleb128 is too long");
+        }
+        result |= piece << shift;
         if byte < 0x80 {
             return Ok((result, i + 1));
         }
@@ -94,4 +107,22 @@ pub fn read_until_nul(data: &[u8], start: usize) -> Result<&[u8]> {
         .position(|byte| *byte == 0)
         .ok_or_else(|| crate::Error::new("unterminated string_data_item"))?;
     Ok(&rest[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_uleb;
+
+    #[test]
+    fn uleb_reads_u32_max() {
+        let data = [0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(read_uleb(&data, 0).unwrap(), (u32::MAX, 5));
+    }
+
+    #[test]
+    fn uleb_rejects_overflowing_fifth_byte() {
+        let data = [0x80, 0x80, 0x80, 0x80, 0x7f];
+        let err = read_uleb(&data, 0).unwrap_err();
+        assert!(err.to_string().contains("uleb128"), "{err}");
+    }
 }

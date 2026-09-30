@@ -15,8 +15,10 @@ pub mod dex;
 pub mod findrefs;
 mod opcodes;
 
-pub use apk::{find_refs, get_class_source, list_classes, manifest_xml, Options};
-pub use decompile::decompile_class;
+pub use apk::{
+    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, DumpStats, Options,
+};
+pub use decompile::{decompile_class, decompile_class_def};
 pub use error::{Error, Result};
 pub use findrefs::{MemberSel, RefQuery};
 

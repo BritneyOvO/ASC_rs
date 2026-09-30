@@ -4,9 +4,8 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::apk::Options;
 use crate::findrefs::{MemberSel, RefQuery};
-use crate::{find_refs, get_class_source, list_classes, manifest_xml, Result};
+use crate::{dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options, Result};
 
 #[derive(Parser)]
 #[command(
@@ -20,6 +19,7 @@ examples:
   asc listclass app.apk -o classes.txt
   asc listclass app.apk --prefix com.poc
   asc getmanifest app.apk -o AndroidManifest.xml
+  asc dump app.apk -o output
   asc findrefs app.apk string token -o string_refs.txt
   asc findrefs app.apk type com.poc.Main
   asc findrefs app.apk method onCreate --class com.poc.Main
@@ -63,6 +63,16 @@ enum Commands {
         debug: bool,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        apk_path: PathBuf,
+    },
+    /// Decompile every class in an APK into a Java tree.
+    Dump {
+        #[arg(long)]
+        debug: bool,
+        #[arg(long, alias = "thread", default_value_t = 8)]
+        threads: usize,
+        #[arg(short, long)]
+        output: PathBuf,
         apk_path: PathBuf,
     },
     /// Find code references for a string, type, method, or field.
@@ -178,6 +188,27 @@ fn execute(cli: Cli) -> Result<()> {
             let started = std::time::Instant::now();
             let xml = manifest_xml(&apk_path)?;
             emit(&xml, output.as_deref(), true)?;
+            if debug {
+                eprintln!(
+                    "[DEBUG] Total Execution Time: {:.2} us",
+                    started.elapsed().as_secs_f64() * 1_000_000.0
+                );
+            }
+        }
+        Commands::Dump {
+            debug,
+            threads,
+            output,
+            apk_path,
+        } => {
+            let started = std::time::Instant::now();
+            let stats = dump_apk(&apk_path, &output, &Options { threads, debug })?;
+            eprintln!(
+                "dumped {} classes ({} errors) -> {}",
+                stats.classes,
+                stats.errors,
+                output.display()
+            );
             if debug {
                 eprintln!(
                     "[DEBUG] Total Execution Time: {:.2} us",

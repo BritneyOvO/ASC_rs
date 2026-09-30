@@ -362,7 +362,8 @@ impl<'a> Dex<'a> {
         let start = pos;
         let (size, n) = read_uleb(self.data, pos)?;
         pos += n;
-        let mut values = Vec::with_capacity(size as usize);
+        let count = bounded_count(size, self.data.len().saturating_sub(pos), 1)?;
+        let mut values = Vec::with_capacity(count);
         for _ in 0..size {
             let (value, n) = self.encoded_value(pos)?;
             pos += n;
@@ -495,8 +496,9 @@ impl<'a> Dex<'a> {
         }
         let map_off = self.header.map_off as usize;
         let count = u32_at(self.data, map_off)?;
-        let mut items = Vec::with_capacity(count as usize);
         let mut pos = map_off + 4;
+        let count = bounded_count(count, self.data.len().saturating_sub(pos), 12)?;
+        let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             if pos + 12 > self.data.len() {
                 bail!("truncated map list");
@@ -521,6 +523,16 @@ pub fn parse_class_data(data: &[u8], mut pos: usize) -> Result<(ClassData, usize
     pos += n;
     let (virtual_methods_size, n) = read_uleb(data, pos)?;
     pos += n;
+    let remaining = data.len().saturating_sub(pos);
+    let min_bytes = checked_span(&[
+        (static_fields_size, 2),
+        (instance_fields_size, 2),
+        (direct_methods_size, 3),
+        (virtual_methods_size, 3),
+    ])?;
+    if min_bytes > remaining {
+        bail!("class data exceeds the buffer");
+    }
 
     let mut static_fields = Vec::with_capacity(static_fields_size as usize);
     let mut field_idx = 0u32;
@@ -585,12 +597,34 @@ pub fn parse_class_data(data: &[u8], mut pos: usize) -> Result<(ClassData, usize
 }
 
 fn read_type_list(data: &[u8], off: usize) -> Result<Vec<u32>> {
-    let size = u32_at(data, off)? as usize;
-    let mut params = Vec::with_capacity(size);
-    for index in 0..size {
+    let size = u32_at(data, off)?;
+    let count = bounded_count(size, data.len().saturating_sub(off.saturating_add(4)), 2)?;
+    let mut params = Vec::with_capacity(count);
+    for index in 0..count {
         params.push(u32::from(u16_at(data, off + 4 + index * 2)?));
     }
     Ok(params)
+}
+
+fn bounded_count(count: u32, remaining: usize, stride: usize) -> Result<usize> {
+    let count = count as usize;
+    if stride == 0 || remaining / stride < count {
+        bail!("count {count} exceeds the remaining {remaining} bytes");
+    }
+    Ok(count)
+}
+
+fn checked_span(parts: &[(u32, usize)]) -> Result<usize> {
+    let mut total = 0usize;
+    for (count, stride) in parts {
+        let part = (*count as usize)
+            .checked_mul(*stride)
+            .ok_or_else(|| crate::Error::new("class data is too large"))?;
+        total = total
+            .checked_add(part)
+            .ok_or_else(|| crate::Error::new("class data is too large"))?;
+    }
+    Ok(total)
 }
 
 pub fn java_type(desc: &str) -> String {
@@ -662,4 +696,19 @@ pub fn normalize_dalvik_class(name: &str) -> Result<String> {
         name.push(';');
     }
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dex;
+
+    #[test]
+    fn huge_encoded_array_does_not_allocate() {
+        let mut data = vec![0u8; 0x78];
+        data[..8].copy_from_slice(b"dex\n035\0");
+        data[0x70..0x75].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
+        let dex = Dex::parse(&data).unwrap();
+        let err = dex.static_literals(0x70).unwrap_err();
+        assert!(err.to_string().contains("count"), "{err}");
+    }
 }

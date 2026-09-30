@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use regex::bytes::RegexBuilder;
 
-use crate::bytes::{u32_at, uleb_len};
+use crate::bytes::u32_at;
 use crate::dex::Dex;
-use crate::opcodes::op_len;
+use crate::opcodes::{op_len, payload_len};
 use crate::Result;
 
 #[derive(Clone, Debug)]
@@ -63,13 +63,17 @@ enum MemberQuery {
 
 struct MemberIndex {
     by_class: HashMap<u32, Vec<u32>>,
-    by_name: HashMap<u32, Vec<u32>>,
+}
+
+struct InsnSpan {
+    start: usize,
+    end: usize,
 }
 
 struct InsnLocator {
     data_len: usize,
     maps: HashMap<u32, Vec<u32>>,
-    bounds: HashMap<u32, usize>,
+    bounds: HashMap<u32, InsnSpan>,
     code_start: usize,
     code_end: usize,
 }
@@ -122,57 +126,28 @@ fn format_matched(dex: &Dex, kind: Kind, idx: u32) -> Result<String> {
     }
 }
 
+fn byte_regex(pattern: &str) -> Result<regex::bytes::Regex> {
+    Ok(RegexBuilder::new(pattern)
+        .unicode(false)
+        .dot_matches_new_line(true)
+        .build()?)
+}
+
+fn anchored_regex(pattern: &str) -> Result<regex::bytes::Regex> {
+    byte_regex(&format!(r"\A(?:{pattern})\z"))
+}
+
 fn locate_strings(dex: &Dex, pattern: &str) -> Result<HashSet<u32>> {
     let size = dex.header.string_ids_size;
     if size == 0 || pattern.is_empty() {
         return Ok(HashSet::new());
     }
-    let mut starts = Vec::with_capacity(size as usize);
-    let mut index_of: HashMap<u32, u32> = HashMap::with_capacity(size as usize + 1);
-    for idx in 0..size {
-        let data_off = u32_at(
-            dex.data,
-            dex.header.string_ids_off as usize + idx as usize * 4,
-        )?;
-        index_of.insert(data_off, idx);
-        starts.push(data_off);
-    }
-    let last = starts[starts.len() - 1] as usize;
-    let payload = last + uleb_len(dex.data, last)?;
-    let nul = dex.data[payload..]
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| crate::Error::new("unterminated string_data_item"))?
-        + payload;
-    let sentinel = (nul + 1) as u32;
-    index_of.insert(sentinel, size);
-    let region_start = starts[0] as usize;
-    let region_end = sentinel as usize;
-    if region_end < region_start || region_end > dex.data.len() {
-        bail!("bad string data range");
-    }
-    let region = &dex.data[region_start..region_end];
-    let regex = RegexBuilder::new(pattern)
-        .unicode(false)
-        .dot_matches_new_line(false)
-        .build()?;
+    let regex = byte_regex(pattern)?;
     let mut found = HashSet::new();
-    for hit in regex.find_iter(region) {
-        let from = region_start + hit.end();
-        if from >= region_end {
-            continue;
-        }
-        let Some(rel) = dex.data[from..region_end]
-            .iter()
-            .position(|byte| *byte == 0)
-        else {
-            continue;
-        };
-        let key = (from + rel + 1) as u32;
-        if let Some(next_idx) = index_of.get(&key) {
-            if *next_idx > 0 {
-                found.insert(next_idx - 1);
-            }
+    for idx in 0..size {
+        let bytes = dex.string_bytes(idx)?;
+        if regex.is_match(bytes) {
+            found.insert(idx);
         }
     }
     Ok(found)
@@ -197,59 +172,78 @@ fn locate_types(dex: &Dex, pattern: &str) -> Result<HashSet<u32>> {
     Ok(found)
 }
 
-fn build_member_index(dex: &Dex, methods: bool) -> Result<MemberIndex> {
+fn member_section(dex: &Dex, methods: bool) -> Result<(usize, u32)> {
     let (off, size) = if methods {
         (dex.header.method_ids_off, dex.header.method_ids_size)
     } else {
         (dex.header.field_ids_off, dex.header.field_ids_size)
     };
-    let mut by_class: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut by_name: HashMap<u32, Vec<u32>> = HashMap::new();
-    for idx in 0..size {
-        let at = off as usize + idx as usize * 8;
-        let class_idx = u32::from(crate::bytes::u16_at(dex.data, at)?);
-        let name_idx = u32_at(dex.data, at + 4)?;
-        by_class.entry(class_idx).or_default().push(idx);
-        by_name.entry(name_idx).or_default().push(idx);
+    let bytes = (size as usize)
+        .checked_mul(8)
+        .ok_or_else(|| crate::Error::new("member id section is too large"))?;
+    let end = (off as usize)
+        .checked_add(bytes)
+        .ok_or_else(|| crate::Error::new("member id section is too large"))?;
+    if end > dex.data.len() {
+        bail!("member id section is out of range");
     }
-    Ok(MemberIndex { by_class, by_name })
+    Ok((off as usize, size))
+}
+
+fn build_member_index(dex: &Dex, methods: bool) -> Result<MemberIndex> {
+    let (off, size) = member_section(dex, methods)?;
+    let mut by_class: HashMap<u32, Vec<u32>> = HashMap::new();
+    for idx in 0..size {
+        let at = off + idx as usize * 8;
+        let class_idx = u32::from(crate::bytes::u16_at(dex.data, at)?);
+        by_class.entry(class_idx).or_default().push(idx);
+    }
+    Ok(MemberIndex { by_class })
+}
+
+fn member_name(dex: &Dex, methods: bool, idx: u32) -> Result<String> {
+    if methods {
+        dex.string(dex.method_id(idx)?.name_idx)
+    } else {
+        dex.string(dex.field_id(idx)?.name_idx)
+    }
 }
 
 fn locate_members(dex: &Dex, sel: &MemberSel, methods: bool) -> Result<HashSet<u32>> {
     let kind = if methods { Kind::Method } else { Kind::Field };
     let query = member_query(kind, sel)?;
-    let index = build_member_index(dex, methods)?;
-    let name_of = |idx: u32| -> Result<String> {
-        if methods {
-            dex.string(dex.method_id(idx)?.name_idx)
-        } else {
-            dex.string(dex.field_id(idx)?.name_idx)
-        }
+    let size = if methods {
+        dex.header.method_ids_size
+    } else {
+        dex.header.field_ids_size
     };
+    member_section(dex, methods)?;
     match query {
         MemberQuery::NameOnly { pattern } => {
-            let name_idxs = locate_strings(dex, &pattern)?;
+            let regex = anchored_regex(&pattern)?;
             let mut found = HashSet::new();
-            for name_idx in name_idxs {
-                if let Some(ids) = index.by_name.get(&name_idx) {
-                    found.extend(ids.iter().copied());
+            for idx in 0..size {
+                if regex.is_match(member_name(dex, methods, idx)?.as_bytes()) {
+                    found.insert(idx);
                 }
             }
             Ok(found)
         }
         MemberQuery::PreciseClass { class_desc, name } => {
+            let index = build_member_index(dex, methods)?;
             let Some(type_idx) = dex.find_type_idx(class_desc.as_bytes())? else {
                 return Ok(HashSet::new());
             };
             let Some(ids) = index.by_class.get(&type_idx) else {
                 return Ok(HashSet::new());
             };
-            filter_names(ids, name.as_deref(), &name_of)
+            filter_exact(dex, methods, ids, name.as_deref())
         }
         MemberQuery::FuzzyClass {
             class_pattern,
             name,
         } => {
+            let index = build_member_index(dex, methods)?;
             let types = locate_types(dex, &class_pattern)?;
             let mut ids = Vec::new();
             for type_idx in types {
@@ -257,36 +251,28 @@ fn locate_members(dex: &Dex, sel: &MemberSel, methods: bool) -> Result<HashSet<u
                     ids.extend(found.iter().copied());
                 }
             }
-            if ids.is_empty() {
-                return Ok(HashSet::new());
-            }
-            if let Some(name) = name {
-                let name_idxs = locate_strings(dex, &name)?;
-                let mut named = HashSet::new();
-                for name_idx in name_idxs {
-                    if let Some(found) = index.by_name.get(&name_idx) {
-                        named.extend(found.iter().copied());
-                    }
+            let Some(name) = name else {
+                return Ok(ids.into_iter().collect());
+            };
+            let regex = anchored_regex(&name)?;
+            let mut found = HashSet::new();
+            for id in ids {
+                if regex.is_match(member_name(dex, methods, id)?.as_bytes()) {
+                    found.insert(id);
                 }
-                Ok(ids.into_iter().filter(|id| named.contains(id)).collect())
-            } else {
-                Ok(ids.into_iter().collect())
             }
+            Ok(found)
         }
     }
 }
 
-fn filter_names(
-    ids: &[u32],
-    name: Option<&str>,
-    name_of: &dyn Fn(u32) -> Result<String>,
-) -> Result<HashSet<u32>> {
+fn filter_exact(dex: &Dex, methods: bool, ids: &[u32], name: Option<&str>) -> Result<HashSet<u32>> {
     let Some(name) = name else {
         return Ok(ids.iter().copied().collect());
     };
     let mut found = HashSet::new();
     for id in ids {
-        if name_of(*id)?.contains(name) {
+        if member_name(dex, methods, *id)? == name {
             found.insert(*id);
         }
     }
@@ -296,15 +282,10 @@ fn filter_names(
 fn member_query(kind: Kind, sel: &MemberSel) -> Result<MemberQuery> {
     let name = sel
         .name
-        .as_ref()
-        .map(|value| value.as_str())
+        .as_deref()
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let class_name = sel
-        .class_name
-        .as_ref()
-        .map(|value| value.as_str())
-        .filter(|value| !value.is_empty());
+    let class_name = sel.class_name.as_deref().filter(|value| !value.is_empty());
     match (class_name, name) {
         (None, None) => {
             bail!(
@@ -394,45 +375,53 @@ impl InsnLocator {
         }
         let start_bucket = (insn_off >> 4) as u32;
         let end_bucket = ((insn_off + insn_bytes - 1) >> 4) as u32;
-        self.bounds.insert(method_idx, insn_off);
-        let merged = match self.maps.get(&start_bucket) {
-            None => vec![method_idx],
-            Some(old) if old.len() == 1 => vec![method_idx, old[0]],
-            Some(old) => {
-                let mut next = old.clone();
-                next.push(method_idx);
-                next
-            }
-        };
+        self.bounds.insert(
+            method_idx,
+            InsnSpan {
+                start: insn_off,
+                end: insn_off + insn_bytes,
+            },
+        );
         for bucket in start_bucket..=end_bucket {
-            self.maps.insert(bucket, merged.clone());
+            let slot = self.maps.entry(bucket).or_default();
+            if !slot.contains(&method_idx) {
+                slot.push(method_idx);
+            }
         }
         Ok(())
     }
 
     fn locate(&self, data: &[u8], offsets: &[usize]) -> Vec<Option<Vec<u32>>> {
-        let mut advanced: HashMap<u32, usize> = HashMap::new();
+        let mut cursor: HashMap<u32, usize> = HashMap::new();
         let mut out = Vec::with_capacity(offsets.len());
         for &offset in offsets {
             let Some(methods) = self.maps.get(&((offset >> 4) as u32)) else {
                 out.push(None);
                 continue;
             };
-            if methods.is_empty() {
-                out.push(None);
-                continue;
+            let mut matched = Vec::new();
+            for &method in methods {
+                let Some(span) = self.bounds.get(&method) else {
+                    continue;
+                };
+                if offset < span.start || offset >= span.end {
+                    continue;
+                }
+                let remembered = cursor.get(&method).copied().unwrap_or(span.start);
+                let start = if remembered <= offset {
+                    remembered
+                } else {
+                    span.start
+                };
+                if instructions_cover(data, start, offset) {
+                    cursor.insert(method, offset);
+                    matched.push(method);
+                }
             }
-            let primary = methods[0];
-            let Some(&base) = self.bounds.get(&primary) else {
+            if matched.is_empty() {
                 out.push(None);
-                continue;
-            };
-            let start = advanced.get(&primary).copied().unwrap_or(base);
-            if instructions_cover(data, start, offset) {
-                advanced.insert(primary, offset);
-                out.push(Some(methods.clone()));
             } else {
-                out.push(None);
+                out.push(Some(matched));
             }
         }
         out
@@ -445,6 +434,16 @@ fn instructions_cover(data: &[u8], start: usize, end: usize) -> bool {
     }
     let mut pos = start;
     while pos < end {
+        if let Some(nbytes) = payload_len(data, pos) {
+            let Some(next) = pos.checked_add(nbytes) else {
+                return false;
+            };
+            if next > end {
+                return false;
+            }
+            pos = next;
+            continue;
+        }
         let opcode = data[pos];
         let units = op_len(opcode);
         if units == 0 {

@@ -3,18 +3,19 @@
 //! DEX members are discovered from the ZIP central directory, inflated only
 //! when a command needs them, and searched in parallel.
 
-use std::fs::File;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
-use std::io::Read;
 
 use crate::axml::manifest_xml as decode_manifest;
-use crate::decompile::decompile_class;
+use crate::decompile::{decompile_class, decompile_class_def};
 use crate::dex::{normalize_dalvik_class, normalize_prefix, Dex};
 use crate::findrefs::{find_in_dex, RefQuery};
 use crate::{Error, Result};
@@ -34,13 +35,37 @@ impl Default for Options {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DumpStats {
+    pub classes: usize,
+    pub errors: usize,
+}
+
 #[derive(Clone, Debug)]
 struct DexEntry {
     name: String,
-    uncomp_size: u32,
-    comp_size: u32,
-    local_header_off: u32,
+    uncomp_size: u64,
+    comp_size: u64,
+    local_header_off: u64,
     method: u16,
+    crc: u32,
+    cd_index: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClassRank {
+    group: u8,
+    ordinal: u32,
+    logical: u32,
+}
+
+struct ZipEntry {
+    name: Vec<u8>,
+    crc: u32,
+    method: u16,
+    comp_size: u64,
+    uncomp_size: u64,
+    local_header_off: u64,
 }
 
 pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Result<Vec<String>> {
@@ -90,12 +115,7 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
     let started = Instant::now();
     let (_file, map) = open_apk(path)?;
     let mut entries = parse_cd_dex_entries(&map)?;
-    entries.sort_by(|left, right| {
-        left.comp_size
-            .cmp(&right.comp_size)
-            .then(left.name.cmp(&right.name))
-            .then(left.local_header_off.cmp(&right.local_header_off))
-    });
+    sort_by_load_order(&mut entries);
     if options.debug {
         eprintln!(
             "[APK] scan setup={:.2} us entries={}",
@@ -118,6 +138,198 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
         );
     }
     Ok(source)
+}
+
+pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpStats> {
+    check_threads(options.threads)?;
+    let started = Instant::now();
+    fs::create_dir_all(out_dir)?;
+    let xml = manifest_xml(path)?;
+    fs::write(out_dir.join("AndroidManifest.xml"), xml)?;
+    let (_file, map) = open_apk(path)?;
+    let entries = parse_cd_dex_entries(&map)?;
+    if entries.is_empty() {
+        return Ok(DumpStats::default());
+    }
+    let ranks: Vec<(u8, u32)> = entries.iter().map(load_key).collect();
+    let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
+    let errors = run_indexed(entries.len(), options.threads, |index| {
+        dump_dex_entry(
+            &map,
+            &entries[index],
+            out_dir,
+            options,
+            ranks[index],
+            &claims,
+        )
+    })?;
+    let total = DumpStats {
+        classes: claims.lock().expect("mutex poisoned").len(),
+        errors: errors.into_iter().sum(),
+    };
+    if options.debug {
+        eprintln!(
+            "[APK] dump total={:.2} us classes={} errors={} workers={}",
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+            total.classes,
+            total.errors,
+            options.threads.min(entries.len())
+        );
+    }
+    Ok(total)
+}
+
+fn dump_dex_entry(
+    apk: &[u8],
+    entry: &DexEntry,
+    out_dir: &Path,
+    options: &Options,
+    rank_base: (u8, u32),
+    claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+) -> Result<usize> {
+    let data = inflate_dex(apk, entry)?;
+    let mut errors = 0usize;
+    for (logical, (_name, buf)) in logical_buffers(&entry.name, data)?.into_iter().enumerate() {
+        let rank = ClassRank {
+            group: rank_base.0,
+            ordinal: rank_base.1,
+            logical: logical as u32,
+        };
+        let dex = Dex::parse(&buf)?;
+        for index in 0..dex.header.class_defs_size {
+            let def = dex.class_def(index)?;
+            let class_desc = match dex.type_desc(def.class_idx) {
+                Ok(desc) => desc,
+                Err(err) => {
+                    errors += 1;
+                    if options.debug {
+                        eprintln!(
+                            "[APK] '{}' class_idx={} type error: {err}",
+                            entry.name, def.class_idx
+                        );
+                    }
+                    continue;
+                }
+            };
+            match decompile_class_def(&dex, &def) {
+                Ok(source) => {
+                    let dest = class_output_path(out_dir, &class_desc);
+                    publish_class(claims, &dest, rank, &source)?;
+                }
+                Err(err) => {
+                    errors += 1;
+                    if options.debug {
+                        eprintln!("[APK] '{}' {class_desc} decompile error: {err}", entry.name);
+                    }
+                }
+            }
+        }
+    }
+    if options.debug {
+        eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
+    }
+    Ok(errors)
+}
+
+fn publish_class(
+    claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    dest: &Path,
+    rank: ClassRank,
+    source: &str,
+) -> Result<()> {
+    if claims
+        .lock()
+        .unwrap()
+        .get(dest)
+        .is_some_and(|prev| *prev < rank)
+    {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("class.java");
+    let tmp = dest.with_file_name(format!(
+        ".{file_name}.{}.{}.{}",
+        rank.group, rank.ordinal, rank.logical
+    ));
+    fs::write(&tmp, source)?;
+    let mut claims = claims.lock().expect("mutex poisoned");
+    if claims.get(dest).is_some_and(|prev| *prev < rank) {
+        drop(claims);
+        let _ = fs::remove_file(&tmp);
+        return Ok(());
+    }
+    fs::rename(&tmp, dest)?;
+    claims.insert(dest.to_path_buf(), rank);
+    Ok(())
+}
+
+fn load_key(entry: &DexEntry) -> (u8, u32) {
+    if let Some(ordinal) = classes_ordinal(&entry.name) {
+        (0, ordinal)
+    } else {
+        (1, entry.cd_index)
+    }
+}
+
+fn classes_ordinal(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(".dex")?;
+    if stem == "classes" {
+        return Some(1);
+    }
+    let digits = stem.strip_prefix("classes")?;
+    if digits.is_empty()
+        || digits.starts_with('0')
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|ordinal| *ordinal >= 2)
+}
+
+fn sort_by_load_order(entries: &mut [DexEntry]) {
+    entries.sort_by(|left, right| {
+        load_key(left)
+            .cmp(&load_key(right))
+            .then(left.local_header_off.cmp(&right.local_header_off))
+            .then(left.name.cmp(&right.name))
+    });
+}
+
+fn class_output_path(out_dir: &Path, descriptor: &str) -> PathBuf {
+    let trimmed = descriptor
+        .strip_prefix('L')
+        .unwrap_or(descriptor)
+        .trim_end_matches(';');
+    let mut dest = out_dir.to_path_buf();
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    for (index, part) in parts.iter().enumerate() {
+        let safe: String = part
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '$' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = if safe.is_empty() {
+            "_".to_string()
+        } else {
+            safe
+        };
+        if index + 1 == parts.len() {
+            dest.push(format!("{name}.java"));
+        } else {
+            dest.push(name);
+        }
+    }
+    dest
 }
 
 pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec<String>> {
@@ -179,10 +391,18 @@ fn check_threads(threads: usize) -> Result<()> {
 }
 
 fn open_apk(path: &Path) -> Result<(File, Mmap)> {
-    let file = File::open(path)
-        .map_err(|err| Error::new(format!("failed to open {}: {err}", path.display())))?;
-    let map = unsafe { Mmap::map(&file) }
-        .map_err(|err| Error::new(format!("failed to map {}: {err}", path.display())))?;
+    let file = File::open(path).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    // SAFETY: `file` is returned with the map, so the descriptor outlives the
+    // mapping, and this process does not remap the same range.
+    let map = unsafe { Mmap::map(&file) }.map_err(|source| Error::IoPath {
+        action: "map",
+        path: path.display().to_string(),
+        source,
+    })?;
     Ok((file, map))
 }
 
@@ -213,7 +433,7 @@ fn find_defining_dex(
                 match inflate_and_hit(apk, &entries[index], target) {
                     Ok(Some((name, buf))) => {
                         best_idx.fetch_min(index, Ordering::Relaxed);
-                        let mut slot = best.lock().unwrap();
+                        let mut slot = best.lock().expect("mutex poisoned");
                         if slot.as_ref().map(|item| index < item.0).unwrap_or(true) {
                             *slot = Some((index, name, buf));
                         }
@@ -227,7 +447,7 @@ fn find_defining_dex(
                         }
                     }
                     Err(err) => {
-                        let mut slot = error.lock().unwrap();
+                        let mut slot = error.lock().expect("mutex poisoned");
                         if slot.as_ref().map(|item| index < item.0).unwrap_or(true) {
                             *slot = Some((index, err));
                         }
@@ -236,8 +456,8 @@ fn find_defining_dex(
             });
         }
     });
-    let best = best.into_inner().unwrap();
-    if let Some((index, err)) = error.into_inner().unwrap() {
+    let best = best.into_inner().expect("mutex poisoned");
+    if let Some((index, err)) = error.into_inner().expect("mutex poisoned") {
         if best.as_ref().map(|item| index < item.0).unwrap_or(true) {
             return Err(err);
         }
@@ -275,7 +495,7 @@ where
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
-                if error.lock().unwrap().is_some() {
+                if error.lock().expect("mutex poisoned").is_some() {
                     break;
                 }
                 let index = cursor.fetch_add(1, Ordering::Relaxed);
@@ -283,9 +503,9 @@ where
                     break;
                 }
                 match work(index) {
-                    Ok(value) => results.lock().unwrap()[index] = Some(value),
+                    Ok(value) => results.lock().expect("mutex poisoned")[index] = Some(value),
                     Err(err) => {
-                        let mut slot = error.lock().unwrap();
+                        let mut slot = error.lock().expect("mutex poisoned");
                         if slot.is_none() {
                             *slot = Some(err);
                         }
@@ -295,7 +515,7 @@ where
             });
         }
     });
-    if let Some(err) = error.into_inner().unwrap() {
+    if let Some(err) = error.into_inner().expect("mutex poisoned") {
         return Err(err);
     }
     results
@@ -309,8 +529,40 @@ where
         .collect()
 }
 
+struct ZipBytes<'a> {
+    name: &'a str,
+    method: u16,
+    crc: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
+    header_offset: u64,
+}
+
 fn inflate_dex(apk: &[u8], entry: &DexEntry) -> Result<Vec<u8>> {
-    let off = entry.local_header_off as usize;
+    inflate_bytes(
+        apk,
+        ZipBytes {
+            name: &entry.name,
+            method: entry.method,
+            crc: entry.crc,
+            compressed_size: entry.comp_size,
+            uncompressed_size: entry.uncomp_size,
+            header_offset: entry.local_header_off,
+        },
+    )
+}
+
+fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
+    let ZipBytes {
+        name,
+        method,
+        crc,
+        compressed_size,
+        uncompressed_size,
+        header_offset,
+    } = entry;
+    let off = usize::try_from(header_offset)
+        .map_err(|_| Error::new(format!("zip offset for {name} exceeds this platform")))?;
     let sig = apk
         .get(off..off + 4)
         .ok_or_else(|| Error::new("bad local header signature"))?;
@@ -320,26 +572,36 @@ fn inflate_dex(apk: &[u8], entry: &DexEntry) -> Result<Vec<u8>> {
     let name_len = crate::bytes::u16_at(apk, off + 26)? as usize;
     let extra_len = crate::bytes::u16_at(apk, off + 28)? as usize;
     let data_off = off + 30 + name_len + extra_len;
-    let data_end = data_off + entry.comp_size as usize;
+    let comp_len = usize::try_from(compressed_size)
+        .map_err(|_| Error::new(format!("compressed size for {name} exceeds this platform")))?;
+    let data_end = data_off
+        .checked_add(comp_len)
+        .ok_or_else(|| Error::new(format!("truncated zip entry {name}")))?;
     let comp = apk
         .get(data_off..data_end)
-        .ok_or_else(|| Error::new(format!("truncated zip entry {}", entry.name)))?;
-    let data = match entry.method {
+        .ok_or_else(|| Error::new(format!("truncated zip entry {name}")))?;
+    let data = match method {
         0 => comp.to_vec(),
         8 => {
             let mut decoder = DeflateDecoder::new(comp);
-            let mut out = Vec::with_capacity(entry.uncomp_size as usize);
+            let mut out = Vec::new();
             decoder.read_to_end(&mut out)?;
             out
         }
         other => bail!("unsupported compression method: {other}"),
     };
-    if entry.uncomp_size != 0 && data.len() != entry.uncomp_size as usize {
+    if uncompressed_size != 0 && data.len() as u64 != uncompressed_size {
         bail!(
-            "size mismatch: expect {}, got {}",
-            entry.uncomp_size,
+            "size mismatch: expect {uncompressed_size}, got {}",
             data.len()
         );
+    }
+    // Packers often store CRC 0. A recorded CRC is checked against the inflated bytes.
+    if crc != 0 {
+        let actual = crc32fast::hash(&data);
+        if actual != crc {
+            bail!("crc mismatch for {name}: stored {crc:08x}, computed {actual:08x}");
+        }
     }
     Ok(data)
 }
@@ -396,97 +658,254 @@ fn normalize_dex041(data: &[u8], header_off: usize) -> Result<Vec<u8>> {
 }
 
 fn parse_cd_dex_entries(apk: &[u8]) -> Result<Vec<DexEntry>> {
-    let eocd = find_eocd(apk).ok_or_else(|| Error::new("EOCD not found"))?;
-    let cd_size = crate::bytes::u32_at(apk, eocd + 12)? as usize;
-    let cd_off = crate::bytes::u32_at(apk, eocd + 16)? as usize;
-    let cd_end = cd_off + cd_size;
-    if cd_end > apk.len() {
-        bail!("central directory exceeds file");
-    }
+    let (cd_off, cd_end) = cd_bounds(apk)?;
     let mut entries = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
+    for (index, entry) in walk_central_directory(apk, cd_off, cd_end)?
+        .iter()
+        .enumerate()
+    {
+        if let Some(dex) = root_dex(entry, index as u32) {
+            if seen.insert(dex.name.clone()) {
+                entries.push(dex);
+            }
+        }
+    }
+    append_classes_heuristic(apk, cd_off, cd_end, &mut entries, &mut seen)?;
+    Ok(entries)
+}
+
+fn root_dex(entry: &ZipEntry, cd_index: u32) -> Option<DexEntry> {
+    if !entry.name.ends_with(b".dex") || entry.name.contains(&b'/') {
+        return None;
+    }
+    Some(DexEntry {
+        name: String::from_utf8_lossy(&entry.name).into_owned(),
+        uncomp_size: entry.uncomp_size,
+        comp_size: entry.comp_size,
+        local_header_off: entry.local_header_off,
+        method: entry.method,
+        crc: entry.crc,
+        cd_index,
+    })
+}
+
+fn append_classes_heuristic(
+    apk: &[u8],
+    cd_off: usize,
+    cd_end: usize,
+    entries: &mut Vec<DexEntry>,
+    seen: &mut HashSet<String>,
+) -> Result<()> {
     let window = &apk[cd_off..cd_end];
     let mut search = 0usize;
     while let Some(rel) = find_subsequence(&window[search..], b"classes") {
         let at = cd_off + search + rel;
-        search += rel + 7;
+        search += rel + b"classes".len();
         if at < 46 {
             continue;
         }
         let header = at - 46;
-        if header < cd_off || apk.get(header..header + 4) != Some(b"PK\x01\x02".as_slice()) {
+        if header < cd_off {
             continue;
         }
-        if let Some(entry) = read_cd_entry(apk, header, cd_end)? {
-            if seen.insert(entry.name.clone()) {
-                entries.push(entry);
+        let Ok(Some((Some(entry), _))) = read_cd_record(apk, header, cd_end) else {
+            continue;
+        };
+        if let Some(dex) = root_dex(&entry, u32::MAX) {
+            if seen.insert(dex.name.clone()) {
+                entries.push(dex);
             }
         }
     }
-    if !entries.is_empty() {
-        return Ok(entries);
+    Ok(())
+}
+
+fn cd_bounds(apk: &[u8]) -> Result<(usize, usize)> {
+    let eocd = find_eocd(apk).ok_or_else(|| Error::new("EOCD not found"))?;
+    let cd_size_32 = crate::bytes::u32_at(apk, eocd + 12)?;
+    let cd_off_32 = crate::bytes::u32_at(apk, eocd + 16)?;
+    let (cd_off, cd_size) = if cd_size_32 == u32::MAX || cd_off_32 == u32::MAX {
+        zip64_cd_bounds(apk, eocd)?
+    } else {
+        (u64::from(cd_off_32), u64::from(cd_size_32))
+    };
+    let start =
+        usize::try_from(cd_off).map_err(|_| Error::new("central directory offset is too large"))?;
+    let size =
+        usize::try_from(cd_size).map_err(|_| Error::new("central directory size is too large"))?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| Error::new("central directory exceeds file"))?;
+    if end > apk.len() {
+        bail!("central directory exceeds file");
     }
+    Ok((start, end))
+}
+
+fn zip64_cd_bounds(apk: &[u8], eocd: usize) -> Result<(u64, u64)> {
+    if eocd < 20 || apk.get(eocd - 20..eocd - 16) != Some(b"PK\x06\x07") {
+        bail!("ZIP64 locator not found");
+    }
+    let loc = eocd - 20;
+    let eocd64 = crate::bytes::u64_at(apk, loc + 8)?;
+    let at = usize::try_from(eocd64).map_err(|_| Error::new("ZIP64 EOCD offset is too large"))?;
+    if apk.get(at..at + 4) != Some(b"PK\x06\x06") || at + 56 > apk.len() {
+        bail!("ZIP64 EOCD not found");
+    }
+    let cd_size = crate::bytes::u64_at(apk, at + 40)?;
+    let cd_off = crate::bytes::u64_at(apk, at + 48)?;
+    Ok((cd_off, cd_size))
+}
+
+fn walk_central_directory(apk: &[u8], cd_off: usize, cd_end: usize) -> Result<Vec<ZipEntry>> {
+    let mut entries = Vec::new();
     let mut ptr = cd_off;
     while ptr + 46 <= cd_end {
-        if apk.get(ptr..ptr + 4) != Some(b"PK\x01\x02".as_slice()) {
+        let Some((maybe, next)) = read_cd_record(apk, ptr, cd_end)? else {
             break;
-        }
-        let name_len = crate::bytes::u16_at(apk, ptr + 28)? as usize;
-        let extra_len = crate::bytes::u16_at(apk, ptr + 30)? as usize;
-        let comment_len = crate::bytes::u16_at(apk, ptr + 32)? as usize;
-        if let Some(entry) = read_cd_entry(apk, ptr, cd_end)? {
+        };
+        if let Some(entry) = maybe {
             entries.push(entry);
         }
-        ptr = ptr + 46 + name_len + extra_len + comment_len;
+        if next <= ptr {
+            break;
+        }
+        ptr = next;
     }
     Ok(entries)
 }
 
-fn read_cd_entry(apk: &[u8], header: usize, cd_end: usize) -> Result<Option<DexEntry>> {
+fn read_cd_record(
+    apk: &[u8],
+    header: usize,
+    cd_end: usize,
+) -> Result<Option<(Option<ZipEntry>, usize)>> {
+    if header + 46 > cd_end || apk.get(header..header + 4) != Some(b"PK\x01\x02") {
+        return Ok(None);
+    }
+    let method = crate::bytes::u16_at(apk, header + 10)?;
+    let crc = crate::bytes::u32_at(apk, header + 16)?;
+    let comp_size = u64::from(crate::bytes::u32_at(apk, header + 20)?);
+    let uncomp_size = u64::from(crate::bytes::u32_at(apk, header + 24)?);
     let name_len = crate::bytes::u16_at(apk, header + 28)? as usize;
+    let extra_len = crate::bytes::u16_at(apk, header + 30)? as usize;
+    let comment_len = crate::bytes::u16_at(apk, header + 32)? as usize;
+    let disk = crate::bytes::u16_at(apk, header + 34)?;
+    let local_off = u64::from(crate::bytes::u32_at(apk, header + 42)?);
     let name_start = header + 46;
-    let name_end = name_start + name_len;
-    if name_end > cd_end || name_end > apk.len() {
+    let extra_start = name_start + name_len;
+    let extra_end = extra_start + extra_len;
+    let next = extra_end + comment_len;
+    if next > cd_end || next > apk.len() {
         return Ok(None);
     }
-    let name_bytes = &apk[name_start..name_end];
-    if !name_bytes.ends_with(b".dex") || name_bytes.contains(&b'/') {
-        return Ok(None);
+    let (uncomp_size, comp_size, local_off, disk) = zip64_resolve(
+        &apk[extra_start..extra_end],
+        uncomp_size,
+        comp_size,
+        local_off,
+        disk,
+    )?;
+    if disk != 0 {
+        return Ok(Some((None, next)));
     }
-    Ok(Some(DexEntry {
-        name: String::from_utf8_lossy(name_bytes).into_owned(),
-        uncomp_size: crate::bytes::u32_at(apk, header + 24)?,
-        comp_size: crate::bytes::u32_at(apk, header + 20)?,
-        local_header_off: crate::bytes::u32_at(apk, header + 42)?,
-        method: crate::bytes::u16_at(apk, header + 10)?,
-    }))
+    Ok(Some((
+        Some(ZipEntry {
+            name: apk[name_start..name_start + name_len].to_vec(),
+            crc,
+            method,
+            comp_size,
+            uncomp_size,
+            local_header_off: local_off,
+        }),
+        next,
+    )))
+}
+
+fn zip64_resolve(
+    extra: &[u8],
+    mut uncomp: u64,
+    mut comp: u64,
+    mut local_off: u64,
+    disk: u16,
+) -> Result<(u64, u64, u64, u32)> {
+    let need_uncomp = uncomp == u64::from(u32::MAX);
+    let need_comp = comp == u64::from(u32::MAX);
+    let need_off = local_off == u64::from(u32::MAX);
+    let need_disk = disk == u16::MAX;
+    if !need_uncomp && !need_comp && !need_off && !need_disk {
+        return Ok((uncomp, comp, local_off, u32::from(disk)));
+    }
+    let data = zip64_extra(extra)?;
+    let mut pos = 0usize;
+    if need_uncomp {
+        uncomp = zip64_u64(data, &mut pos)?;
+    }
+    if need_comp {
+        comp = zip64_u64(data, &mut pos)?;
+    }
+    if need_off {
+        local_off = zip64_u64(data, &mut pos)?;
+    }
+    let resolved_disk = if need_disk {
+        if pos + 4 > data.len() {
+            bail!("truncated ZIP64 extra field");
+        }
+        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+    } else {
+        u32::from(disk)
+    };
+    Ok((uncomp, comp, local_off, resolved_disk))
+}
+
+fn zip64_extra(extra: &[u8]) -> Result<&[u8]> {
+    let mut pos = 0usize;
+    while pos + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[pos], extra[pos + 1]]);
+        let size = u16::from_le_bytes([extra[pos + 2], extra[pos + 3]]) as usize;
+        let start = pos + 4;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| Error::new("truncated ZIP64 extra field"))?;
+        if end > extra.len() {
+            bail!("truncated ZIP64 extra field");
+        }
+        if id == 0x0001 {
+            return Ok(&extra[start..end]);
+        }
+        pos = end;
+    }
+    bail!("ZIP64 extra field is missing");
+}
+
+fn zip64_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
+    if *pos + 8 > data.len() {
+        bail!("truncated ZIP64 extra field");
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&data[*pos..*pos + 8]);
+    *pos += 8;
+    Ok(u64::from_le_bytes(buf))
 }
 
 fn read_zip_entry(apk: &[u8], wanted: &str) -> Result<Vec<u8>> {
-    let eocd = find_eocd(apk).ok_or_else(|| Error::new("EOCD not found"))?;
-    let cd_size = crate::bytes::u32_at(apk, eocd + 12)? as usize;
-    let cd_off = crate::bytes::u32_at(apk, eocd + 16)? as usize;
-    let cd_end = cd_off + cd_size;
-    let mut ptr = cd_off;
-    while ptr + 46 <= cd_end {
-        if apk.get(ptr..ptr + 4) != Some(b"PK\x01\x02".as_slice()) {
-            break;
+    let (cd_off, cd_end) = cd_bounds(apk)?;
+    let wanted_bytes = wanted.as_bytes();
+    for entry in walk_central_directory(apk, cd_off, cd_end)? {
+        if entry.name.as_slice() == wanted_bytes {
+            return inflate_bytes(
+                apk,
+                ZipBytes {
+                    name: wanted,
+                    method: entry.method,
+                    crc: entry.crc,
+                    compressed_size: entry.comp_size,
+                    uncompressed_size: entry.uncomp_size,
+                    header_offset: entry.local_header_off,
+                },
+            );
         }
-        let name_len = crate::bytes::u16_at(apk, ptr + 28)? as usize;
-        let extra_len = crate::bytes::u16_at(apk, ptr + 30)? as usize;
-        let comment_len = crate::bytes::u16_at(apk, ptr + 32)? as usize;
-        let name = &apk[ptr + 46..ptr + 46 + name_len];
-        if name == wanted.as_bytes() {
-            let entry = DexEntry {
-                name: wanted.to_string(),
-                uncomp_size: crate::bytes::u32_at(apk, ptr + 24)?,
-                comp_size: crate::bytes::u32_at(apk, ptr + 20)?,
-                local_header_off: crate::bytes::u32_at(apk, ptr + 42)?,
-                method: crate::bytes::u16_at(apk, ptr + 10)?,
-            };
-            return inflate_dex(apk, &entry);
-        }
-        ptr = ptr + 46 + name_len + extra_len + comment_len;
     }
     bail!("AndroidManifest.xml not found in APK");
 }

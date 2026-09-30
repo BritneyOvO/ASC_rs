@@ -1,19 +1,42 @@
 //! Native class printer. Signatures are Java; method bodies are a direct lift
 //! of Dalvik instructions, so they stay readable without a whole-program IR.
 
+use crate::bytes::{u16_at, u32_at};
 use crate::dex::{java_quote, java_type, ClassDef, CodeItem, Dex, EncodedField, EncodedMethod};
 use crate::opcodes::{
-    OpInfo, FMT_10T, FMT_10X, FMT_11N, FMT_11X, FMT_12X, FMT_20T, FMT_21C, FMT_21H, FMT_21S,
-    FMT_21T, FMT_22B, FMT_22C, FMT_22S, FMT_22T, FMT_22X, FMT_23X, FMT_30T, FMT_31C, FMT_31I,
-    FMT_31T, FMT_32X, FMT_35C, FMT_3RC, FMT_51L, IDX_FIELD, IDX_METHOD, IDX_STRING, IDX_TYPE, OPS,
+    payload_len, Arith, BinShape, Fmt, IfKind, IndexKind, InvokeShape, InvokeTarget, OpInfo,
+    OpKind, OPS,
 };
 use crate::Result;
+
+const ACC_PUBLIC: u32 = 0x0001;
+const ACC_PRIVATE: u32 = 0x0002;
+const ACC_PROTECTED: u32 = 0x0004;
+const ACC_STATIC: u32 = 0x0008;
+const ACC_FINAL: u32 = 0x0010;
+const ACC_SYNCHRONIZED: u32 = 0x0020;
+const ACC_VOLATILE: u32 = 0x0040;
+const ACC_TRANSIENT: u32 = 0x0080;
+const ACC_NATIVE: u32 = 0x0100;
+const ACC_INTERFACE: u32 = 0x0200;
+const ACC_ABSTRACT: u32 = 0x0400;
+const ACC_ANNOTATION: u32 = 0x2000;
+const ACC_ENUM: u32 = 0x4000;
+
+enum Member {
+    Field,
+    Method,
+}
 
 pub fn decompile_class(data: &[u8], descriptor: &str) -> Result<String> {
     let dex = Dex::parse(data)?;
     let Some(def) = dex.find_class_def(descriptor)? else {
         bail!("Class {descriptor} not found in DEX.");
     };
+    decompile_class_def(&dex, &def)
+}
+
+pub fn decompile_class_def(dex: &Dex<'_>, def: &ClassDef) -> Result<String> {
     let class_desc = dex.type_desc(def.class_idx)?;
     let (package, simple) = split_class(&class_desc);
     let mut out = String::new();
@@ -22,7 +45,7 @@ pub fn decompile_class(data: &[u8], descriptor: &str) -> Result<String> {
         out.push_str(&package);
         out.push_str(";\n\n");
     }
-    out.push_str(&class_header(&dex, &def, &simple)?);
+    out.push_str(&class_header(dex, def, &simple)?);
     out.push_str(" {\n");
     let class_data = if def.class_data_off == 0 {
         None
@@ -33,11 +56,11 @@ pub fn decompile_class(data: &[u8], descriptor: &str) -> Result<String> {
         let literals = dex.static_literals(def.static_values_off)?;
         for (index, field) in class_data.static_fields.iter().enumerate() {
             let init = literals.get(index).map(String::as_str);
-            out.push_str(&field_line(&dex, field, init)?);
+            out.push_str(&field_line(dex, field, init)?);
             out.push('\n');
         }
         for field in &class_data.instance_fields {
-            out.push_str(&field_line(&dex, field, None)?);
+            out.push_str(&field_line(dex, field, None)?);
             out.push('\n');
         }
         if !class_data.static_fields.is_empty() || !class_data.instance_fields.is_empty() {
@@ -45,7 +68,7 @@ pub fn decompile_class(data: &[u8], descriptor: &str) -> Result<String> {
         }
         let methods: Vec<&EncodedMethod> = class_data.methods().collect();
         for (index, method) in methods.iter().enumerate() {
-            out.push_str(&method_block(&dex, &simple, method)?);
+            out.push_str(&method_block(dex, &simple, method)?);
             if index + 1 != methods.len() {
                 out.push('\n');
             }
@@ -57,23 +80,23 @@ pub fn decompile_class(data: &[u8], descriptor: &str) -> Result<String> {
 
 fn class_header(dex: &Dex, def: &ClassDef, simple: &str) -> Result<String> {
     let flags = def.access_flags;
-    let interface = flags & 0x200 != 0;
+    let interface = flags & ACC_INTERFACE != 0;
     let mut shown = flags;
     if interface {
-        shown &= !0x400;
+        shown &= !ACC_ABSTRACT;
     }
     let mut mods = String::new();
-    push_flag(&mut mods, shown, 0x1, "public");
-    push_flag(&mut mods, shown, 0x2, "private");
-    push_flag(&mut mods, shown, 0x4, "protected");
-    push_flag(&mut mods, shown, 0x8, "static");
-    push_flag(&mut mods, shown, 0x10, "final");
-    push_flag(&mut mods, shown, 0x400, "abstract");
-    let kind = if flags & 0x2000 != 0 {
+    push_flag(&mut mods, shown, ACC_PUBLIC, "public");
+    push_flag(&mut mods, shown, ACC_PRIVATE, "private");
+    push_flag(&mut mods, shown, ACC_PROTECTED, "protected");
+    push_flag(&mut mods, shown, ACC_STATIC, "static");
+    push_flag(&mut mods, shown, ACC_FINAL, "final");
+    push_flag(&mut mods, shown, ACC_ABSTRACT, "abstract");
+    let kind = if flags & ACC_ANNOTATION != 0 {
         "@interface"
     } else if interface {
         "interface"
-    } else if flags & 0x4000 != 0 {
+    } else if flags & ACC_ENUM != 0 {
         "enum"
     } else {
         "class"
@@ -109,7 +132,7 @@ fn field_line(dex: &Dex, field: &EncodedField, init: Option<&str>) -> Result<Str
     let id = dex.field_id(field.field_idx)?;
     let ty = java_type(&dex.type_desc(u32::from(id.type_idx))?);
     let name = dex.string(id.name_idx)?;
-    let mods = member_mods(field.access_flags, true);
+    let mods = member_mods(field.access_flags, Member::Field);
     if let Some(init) = init {
         Ok(format!("    {mods}{ty} {name} = {init};"))
     } else {
@@ -136,7 +159,7 @@ fn method_block(dex: &Dex, simple: &str, method: &EncodedMethod) -> Result<Strin
     let mods = if is_clinit {
         String::new()
     } else {
-        member_mods(method.access_flags, false)
+        member_mods(method.access_flags, Member::Method)
     };
     let signature = if is_clinit {
         "    static {".to_string()
@@ -165,7 +188,7 @@ fn lift_code(dex: &Dex, code: &CodeItem) -> Result<String> {
     let mut pos = 0;
     let mut out = String::new();
     while pos + 1 < insns.len() {
-        if let Some(nbytes) = payload_bytes(insns, pos) {
+        if let Some(nbytes) = payload_len(insns, pos) {
             if pos + nbytes > insns.len() {
                 break;
             }
@@ -190,177 +213,193 @@ fn lift_code(dex: &Dex, code: &CodeItem) -> Result<String> {
     Ok(out)
 }
 
-fn payload_bytes(insns: &[u8], pos: usize) -> Option<usize> {
-    if insns[pos] != 0x00 || pos + 4 > insns.len() {
-        return None;
-    }
-    let ident = u16::from_le_bytes([insns[pos], insns[pos + 1]]);
-    match ident {
-        0x0100 => {
-            let size = u16::from_le_bytes([insns[pos + 2], insns[pos + 3]]) as usize;
-            Some(8 + size * 4)
-        }
-        0x0200 => {
-            let size = u16::from_le_bytes([insns[pos + 2], insns[pos + 3]]) as usize;
-            Some(4 + size * 8)
-        }
-        0x0300 => {
-            if pos + 8 > insns.len() {
-                return None;
-            }
-            let width = u16::from_le_bytes([insns[pos + 2], insns[pos + 3]]) as usize;
-            let size = u32::from_le_bytes([
-                insns[pos + 4],
-                insns[pos + 5],
-                insns[pos + 6],
-                insns[pos + 7],
-            ]) as usize;
-            let bytes = 8 + width * size;
-            Some((bytes + 1) & !1)
-        }
-        _ => None,
-    }
-}
-
 fn format_insn(dex: &Dex, insns: &[u8], pos: usize, info: OpInfo) -> Result<String> {
-    let name = info.name;
-    if name == "return-void" {
-        return Ok("return;".to_string());
-    }
-    if name == "return" || name == "return-wide" || name == "return-object" {
-        return Ok(format!("return {};", reg(insns[pos + 1] as u32)));
-    }
-    if name == "throw" {
-        return Ok(format!("throw {};", reg(insns[pos + 1] as u32)));
-    }
-    if name == "const-string" || name == "const-string/jumbo" {
-        let (dest, idx) = if info.fmt == FMT_31C {
-            (insns[pos + 1] as u32, u32_at(insns, pos + 2))
-        } else {
-            (insns[pos + 1] as u32, u32::from(u16_at(insns, pos + 2)))
-        };
-        return Ok(format!(
-            "{} = {};",
-            reg(dest),
-            java_quote(&dex.string(idx)?)
-        ));
-    }
-    if let Some(op) = if_op(name) {
-        if name.ends_with('z') {
-            let dest = insns[pos + 1] as u32;
-            let off = i16_at(insns, pos + 2);
-            return Ok(format!("if ({} {op}) goto {off:+};", reg(dest)));
+    match info.kind {
+        OpKind::ReturnVoid => Ok("return;".to_string()),
+        OpKind::Return => Ok(format!("return {};", reg(u32::from(insns[pos + 1])))),
+        OpKind::Throw => Ok(format!("throw {};", reg(u32::from(insns[pos + 1])))),
+        OpKind::ConstString => {
+            let (dest, idx) = match info.fmt {
+                Fmt::F31c => (u32::from(insns[pos + 1]), u32_at(insns, pos + 2)?),
+                Fmt::F21c => (
+                    u32::from(insns[pos + 1]),
+                    u32::from(u16_at(insns, pos + 2)?),
+                ),
+                Fmt::F10x
+                | Fmt::F12x
+                | Fmt::F11n
+                | Fmt::F11x
+                | Fmt::F10t
+                | Fmt::F20t
+                | Fmt::F22x
+                | Fmt::F21t
+                | Fmt::F21s
+                | Fmt::F21h
+                | Fmt::F23x
+                | Fmt::F22b
+                | Fmt::F22t
+                | Fmt::F22s
+                | Fmt::F22c
+                | Fmt::F32x
+                | Fmt::F30t
+                | Fmt::F31t
+                | Fmt::F31i
+                | Fmt::F35c
+                | Fmt::F3rc
+                | Fmt::F51l
+                | Fmt::F45cc
+                | Fmt::F4rcc => (
+                    u32::from(insns[pos + 1]),
+                    u32::from(u16_at(insns, pos + 2)?),
+                ),
+            };
+            Ok(format!(
+                "{} = {};",
+                reg(dest),
+                java_quote(&dex.string(idx)?)
+            ))
         }
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        let off = i16_at(insns, pos + 2);
-        return Ok(format!("if ({} {op} {}) goto {off:+};", reg(a), reg(b)));
-    }
-    if name == "goto" {
-        let off = insns[pos + 1] as i8 as i32;
-        return Ok(format!("goto {off:+};"));
-    }
-    if name == "goto/16" {
-        return Ok(format!("goto {:+};", i16_at(insns, pos + 2)));
-    }
-    if name == "goto/32" {
-        return Ok(format!("goto {:+};", i32_at(insns, pos + 2)));
-    }
-    if name.starts_with("move")
-        && !name.starts_with("move-result")
-        && !name.starts_with("move-exception")
-    {
-        let (a, b) = regs_of_move(insns, pos, info.fmt);
-        return Ok(format!("{} = {};", reg(a), reg(b)));
-    }
-    if name.starts_with("move-result") || name == "move-exception" {
-        return Ok(format!("{} = result;", reg(insns[pos + 1] as u32)));
-    }
-    if name.starts_with("const/") || name == "const" || name.starts_with("const-wide") {
-        let (dest, value) = const_literal(insns, pos, info.fmt, name);
-        return Ok(format!("{} = {value};", reg(dest)));
-    }
-    if name.starts_with("iget") || name.starts_with("iput") {
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        let field = dex.format_field(u32::from(u16_at(insns, pos + 2)))?;
-        return if name.starts_with("iget") {
-            Ok(format!("{} = {}.{field};", reg(a), reg(b)))
-        } else {
-            Ok(format!("{}.{field} = {};", reg(b), reg(a)))
-        };
-    }
-    if name.starts_with("sget") || name.starts_with("sput") {
-        let dest = insns[pos + 1] as u32;
-        let field = dex.format_field(u32::from(u16_at(insns, pos + 2)))?;
-        return if name.starts_with("sget") {
-            Ok(format!("{} = {field};", reg(dest)))
-        } else {
-            Ok(format!("{field} = {};", reg(dest)))
-        };
-    }
-    if name == "new-instance" {
-        let dest = insns[pos + 1] as u32;
-        let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)))?);
-        return Ok(format!("{} = new {ty}();", reg(dest)));
-    }
-    if name == "new-array" {
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)))?);
-        let elem = ty.trim_end_matches("[]");
-        return Ok(format!("{} = new {elem}[{}];", reg(a), reg(b)));
-    }
-    if name == "array-length" {
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        return Ok(format!("{} = {}.length;", reg(a), reg(b)));
-    }
-    if name == "check-cast" {
-        let dest = insns[pos + 1] as u32;
-        let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)))?);
-        return Ok(format!("{} = ({ty}) {};", reg(dest), reg(dest)));
-    }
-    if name == "instance-of" {
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)))?);
-        return Ok(format!("{} = {} instanceof {ty};", reg(a), reg(b)));
-    }
-    if name.starts_with("invoke-") {
-        return format_invoke(dex, insns, pos, name);
-    }
-    if let Some(symbol) = binary_symbol(name) {
-        if name.contains("2addr") {
-            let a = (insns[pos + 1] & 0x0f) as u32;
-            let b = (insns[pos + 1] >> 4) as u32;
-            return Ok(format!("{} = {} {symbol} {};", reg(a), reg(a), reg(b)));
+        OpKind::If(kind) => format_if(insns, pos, kind),
+        OpKind::Goto => {
+            let off = i32::from(insns[pos + 1] as i8);
+            Ok(format!("goto {off:+};"))
         }
-        if name.contains("lit") || name.starts_with("rsub") {
-            let (a, b, lit) = lit_binop(insns, pos, info.fmt);
-            if name.starts_with("rsub") {
-                return Ok(format!("{} = {lit} - {};", reg(a), reg(b)));
+        OpKind::Goto16 => Ok(format!("goto {:+};", i16_at(insns, pos + 2)?)),
+        OpKind::Goto32 => Ok(format!("goto {:+};", i32_at(insns, pos + 2)?)),
+        OpKind::Move => {
+            let (a, b) = regs_of_move(insns, pos, info.fmt)?;
+            Ok(format!("{} = {};", reg(a), reg(b)))
+        }
+        OpKind::MoveResult => Ok(format!("{} = result;", reg(u32::from(insns[pos + 1])))),
+        OpKind::Const { wide } => {
+            let (dest, value) = const_literal(insns, pos, info.fmt, wide)?;
+            Ok(format!("{} = {value};", reg(dest)))
+        }
+        OpKind::Iget | OpKind::Iput => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            let field = dex.format_field(u32::from(u16_at(insns, pos + 2)?))?;
+            if matches!(info.kind, OpKind::Iget) {
+                Ok(format!("{} = {}.{field};", reg(a), reg(b)))
+            } else {
+                Ok(format!("{}.{field} = {};", reg(b), reg(a)))
             }
-            return Ok(format!("{} = {} {symbol} {lit};", reg(a), reg(b)));
         }
-        let a = insns[pos + 1] as u32;
-        let b = insns[pos + 2] as u32;
-        let c = insns[pos + 3] as u32;
-        return Ok(format!("{} = {} {symbol} {};", reg(a), reg(b), reg(c)));
+        OpKind::Sget | OpKind::Sput => {
+            let dest = u32::from(insns[pos + 1]);
+            let field = dex.format_field(u32::from(u16_at(insns, pos + 2)?))?;
+            if matches!(info.kind, OpKind::Sget) {
+                Ok(format!("{} = {field};", reg(dest)))
+            } else {
+                Ok(format!("{field} = {};", reg(dest)))
+            }
+        }
+        OpKind::NewInstance => {
+            let dest = u32::from(insns[pos + 1]);
+            let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)?))?);
+            Ok(format!("{} = new {ty}();", reg(dest)))
+        }
+        OpKind::NewArray => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)?))?);
+            let elem = ty.strip_suffix("[]").unwrap_or(&ty);
+            Ok(format!("{} = new {elem}[{}];", reg(a), reg(b)))
+        }
+        OpKind::ArrayLength => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            Ok(format!("{} = {}.length;", reg(a), reg(b)))
+        }
+        OpKind::CheckCast => {
+            let dest = u32::from(insns[pos + 1]);
+            let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)?))?);
+            Ok(format!("{} = ({ty}) {};", reg(dest), reg(dest)))
+        }
+        OpKind::InstanceOf => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            let ty = java_type(&dex.type_desc(u32::from(u16_at(insns, pos + 2)?))?);
+            Ok(format!("{} = {} instanceof {ty};", reg(a), reg(b)))
+        }
+        OpKind::Invoke { target, shape } => format_invoke(dex, insns, pos, target, shape),
+        OpKind::Binop { arith, shape } => format_binop(insns, pos, info.fmt, arith, shape),
+        OpKind::Plain => Ok(format!(
+            "{} {}",
+            info.name,
+            fallback_operands(dex, insns, pos, info)?
+        )),
     }
-    Ok(format!(
-        "{name} {}",
-        fallback_operands(dex, insns, pos, info)?
-    ))
 }
 
-fn format_invoke(dex: &Dex, insns: &[u8], pos: usize, name: &str) -> Result<String> {
-    let (index, regs, _proto) = invoke_operands(insns, pos, name);
+fn format_if(insns: &[u8], pos: usize, kind: IfKind) -> Result<String> {
+    let off = i16_at(insns, pos + 2)?;
+    match kind {
+        IfKind::Zero(cmp) => {
+            let dest = u32::from(insns[pos + 1]);
+            Ok(format!(
+                "if ({} {} 0) goto {off:+};",
+                reg(dest),
+                cmp.symbol()
+            ))
+        }
+        IfKind::Cmp(cmp) => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            Ok(format!(
+                "if ({} {} {}) goto {off:+};",
+                reg(a),
+                cmp.symbol(),
+                reg(b)
+            ))
+        }
+    }
+}
+
+fn format_binop(
+    insns: &[u8],
+    pos: usize,
+    fmt: Fmt,
+    arith: Arith,
+    shape: BinShape,
+) -> Result<String> {
+    let symbol = arith.symbol();
+    match shape {
+        BinShape::TwoAddr => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
+            Ok(format!("{} = {} {symbol} {};", reg(a), reg(a), reg(b)))
+        }
+        BinShape::Rsub => {
+            let (a, b, lit) = lit_binop(insns, pos, fmt)?;
+            Ok(format!("{} = {lit} - {};", reg(a), reg(b)))
+        }
+        BinShape::Lit => {
+            let (a, b, lit) = lit_binop(insns, pos, fmt)?;
+            Ok(format!("{} = {} {symbol} {lit};", reg(a), reg(b)))
+        }
+        BinShape::Regs => {
+            let a = u32::from(insns[pos + 1]);
+            let b = u32::from(insns[pos + 2]);
+            let c = u32::from(insns[pos + 3]);
+            Ok(format!("{} = {} {symbol} {};", reg(a), reg(b), reg(c)))
+        }
+    }
+}
+
+fn format_invoke(
+    dex: &Dex,
+    insns: &[u8],
+    pos: usize,
+    target: InvokeTarget,
+    shape: InvokeShape,
+) -> Result<String> {
+    let (index, regs, _proto) = invoke_operands(insns, pos, target, shape)?;
     let method = dex.method_id(index)?;
     let method_name = dex.string(method.name_idx)?;
     let owner = java_type(&dex.type_desc(u32::from(method.class_idx))?);
     let rendered: Vec<String> = regs.iter().map(|reg| reg_name(*reg)).collect();
-    let call = if name.contains("static") || name.contains("custom") {
+    let call = if target.skips_receiver() {
         format!("{owner}.{method_name}({})", rendered.join(", "))
     } else if rendered.is_empty() {
         format!("{owner}.{method_name}()")
@@ -374,199 +413,242 @@ fn format_invoke(dex: &Dex, insns: &[u8], pos: usize, name: &str) -> Result<Stri
     Ok(format!("{call};"))
 }
 
-fn invoke_operands(insns: &[u8], pos: usize, name: &str) -> (u32, Vec<u32>, Option<u32>) {
-    if name.contains("range") {
-        let count = insns[pos + 1] as u32;
-        let index = u32::from(u16_at(insns, pos + 2));
-        let start = u32::from(u16_at(insns, pos + 4));
-        let proto = if name.contains("polymorphic") {
-            Some(u32::from(u16_at(insns, pos + 6)))
-        } else {
-            None
-        };
-        let regs = (0..count).map(|offset| start + offset).collect();
-        (index, regs, proto)
-    } else {
-        let byte = insns[pos + 1];
-        let count = (byte & 0x0f) as usize;
-        let g = (byte >> 4) as u32;
-        let index = u32::from(u16_at(insns, pos + 2));
-        let fedc = u16_at(insns, pos + 4);
-        let nibbles = [
-            (fedc & 0x0f) as u32,
-            ((fedc >> 4) & 0x0f) as u32,
-            ((fedc >> 8) & 0x0f) as u32,
-            ((fedc >> 12) & 0x0f) as u32,
-            g,
-        ];
-        let proto = if name.contains("polymorphic") {
-            Some(u32::from(u16_at(insns, pos + 6)))
-        } else {
-            None
-        };
-        (index, nibbles[..count.min(5)].to_vec(), proto)
+fn invoke_operands(
+    insns: &[u8],
+    pos: usize,
+    target: InvokeTarget,
+    shape: InvokeShape,
+) -> Result<(u32, Vec<u32>, Option<u32>)> {
+    match shape {
+        InvokeShape::Range => {
+            let count = u32::from(insns[pos + 1]);
+            let index = u32::from(u16_at(insns, pos + 2)?);
+            let start = u32::from(u16_at(insns, pos + 4)?);
+            let proto = if target.carries_proto() {
+                Some(u32::from(u16_at(insns, pos + 6)?))
+            } else {
+                None
+            };
+            let regs = (0..count).map(|offset| start + offset).collect();
+            Ok((index, regs, proto))
+        }
+        InvokeShape::List => {
+            let byte = insns[pos + 1];
+            let count = usize::from(byte & 0x0f);
+            let g = u32::from(byte >> 4);
+            let index = u32::from(u16_at(insns, pos + 2)?);
+            let fedc = u16_at(insns, pos + 4)?;
+            let nibbles = [
+                u32::from(fedc & 0x0f),
+                u32::from((fedc >> 4) & 0x0f),
+                u32::from((fedc >> 8) & 0x0f),
+                u32::from((fedc >> 12) & 0x0f),
+                g,
+            ];
+            let proto = if target.carries_proto() {
+                Some(u32::from(u16_at(insns, pos + 6)?))
+            } else {
+                None
+            };
+            Ok((index, nibbles[..count.min(5)].to_vec(), proto))
+        }
     }
 }
 
 fn fallback_operands(dex: &Dex, insns: &[u8], pos: usize, info: OpInfo) -> Result<String> {
     let text = match info.fmt {
-        FMT_10X => String::new(),
-        FMT_12X | FMT_11N => {
-            let a = (insns[pos + 1] & 0x0f) as u32;
-            let b = (insns[pos + 1] >> 4) as u32;
+        Fmt::F10x => String::new(),
+        Fmt::F12x | Fmt::F11n => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
             format!("{}, {}", reg(a), reg(b))
         }
-        FMT_11X | FMT_10T => reg(insns[pos + 1] as u32),
-        FMT_22X | FMT_21T | FMT_21S | FMT_21H | FMT_21C => {
-            let a = insns[pos + 1] as u32;
-            let b = u16_at(insns, pos + 2);
+        Fmt::F11x | Fmt::F10t => reg(u32::from(insns[pos + 1])),
+        Fmt::F22x | Fmt::F21t | Fmt::F21s | Fmt::F21h | Fmt::F21c => {
+            let a = u32::from(insns[pos + 1]);
+            let b = u16_at(insns, pos + 2)?;
             format!("{}, {}", reg(a), ref_or_raw(dex, info.index, u32::from(b))?)
         }
-        FMT_23X => format!(
+        Fmt::F23x => format!(
             "{}, {}, {}",
-            reg(insns[pos + 1] as u32),
-            reg(insns[pos + 2] as u32),
-            reg(insns[pos + 3] as u32)
+            reg(u32::from(insns[pos + 1])),
+            reg(u32::from(insns[pos + 2])),
+            reg(u32::from(insns[pos + 3]))
         ),
-        FMT_22C | FMT_22T | FMT_22S => {
-            let a = (insns[pos + 1] & 0x0f) as u32;
-            let b = (insns[pos + 1] >> 4) as u32;
+        Fmt::F22c | Fmt::F22t | Fmt::F22s => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let b = u32::from(insns[pos + 1] >> 4);
             format!(
                 "{}, {}, {}",
                 reg(a),
                 reg(b),
-                ref_or_raw(dex, info.index, u32::from(u16_at(insns, pos + 2)))?
+                ref_or_raw(dex, info.index, u32::from(u16_at(insns, pos + 2)?))?
             )
         }
-        FMT_35C | FMT_3RC | FMT_31C | FMT_31I | FMT_31T | FMT_32X | FMT_30T | FMT_51L | FMT_20T
-        | FMT_22B => name_bytes(insns, pos, info.len),
-        _ => name_bytes(insns, pos, info.len),
+        Fmt::F35c
+        | Fmt::F3rc
+        | Fmt::F31c
+        | Fmt::F31i
+        | Fmt::F31t
+        | Fmt::F32x
+        | Fmt::F30t
+        | Fmt::F51l
+        | Fmt::F20t
+        | Fmt::F22b
+        | Fmt::F45cc
+        | Fmt::F4rcc => name_bytes(insns, pos, info.len),
     };
     Ok(text)
 }
 
-fn ref_or_raw(dex: &Dex, index_kind: u8, idx: u32) -> Result<String> {
+fn ref_or_raw(dex: &Dex, index_kind: IndexKind, idx: u32) -> Result<String> {
     match index_kind {
-        IDX_STRING => Ok(java_quote(&dex.string(idx)?)),
-        IDX_TYPE => Ok(java_type(&dex.type_desc(idx)?)),
-        IDX_FIELD => dex.format_field(idx),
-        IDX_METHOD => dex.format_method(idx),
-        _ => Ok(format!("@{idx}")),
+        IndexKind::String => Ok(java_quote(&dex.string(idx)?)),
+        IndexKind::Type => Ok(java_type(&dex.type_desc(idx)?)),
+        IndexKind::Field => dex.format_field(idx),
+        IndexKind::Method => dex.format_method(idx),
+        IndexKind::None
+        | IndexKind::MethodProto
+        | IndexKind::CallSite
+        | IndexKind::MethodHandle
+        | IndexKind::Proto => Ok(format!("@{idx}")),
     }
 }
 
 fn name_bytes(insns: &[u8], pos: usize, len: u8) -> String {
-    insns[pos + 1..pos + len as usize * 2]
+    insns[pos + 1..pos + usize::from(len) * 2]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn regs_of_move(insns: &[u8], pos: usize, fmt: u8) -> (u32, u32) {
+fn regs_of_move(insns: &[u8], pos: usize, fmt: Fmt) -> Result<(u32, u32)> {
     match fmt {
-        FMT_12X => ((insns[pos + 1] & 0x0f) as u32, (insns[pos + 1] >> 4) as u32),
-        FMT_22X => (insns[pos + 1] as u32, u32::from(u16_at(insns, pos + 2))),
-        FMT_32X => (
-            u32::from(u16_at(insns, pos + 2)),
-            u32::from(u16_at(insns, pos + 4)),
-        ),
-        _ => (insns[pos + 1] as u32, 0),
+        Fmt::F12x => Ok((
+            u32::from(insns[pos + 1] & 0x0f),
+            u32::from(insns[pos + 1] >> 4),
+        )),
+        Fmt::F22x => Ok((
+            u32::from(insns[pos + 1]),
+            u32::from(u16_at(insns, pos + 2)?),
+        )),
+        Fmt::F32x => Ok((
+            u32::from(u16_at(insns, pos + 2)?),
+            u32::from(u16_at(insns, pos + 4)?),
+        )),
+        Fmt::F10x
+        | Fmt::F11n
+        | Fmt::F11x
+        | Fmt::F10t
+        | Fmt::F20t
+        | Fmt::F21t
+        | Fmt::F21s
+        | Fmt::F21h
+        | Fmt::F21c
+        | Fmt::F23x
+        | Fmt::F22b
+        | Fmt::F22t
+        | Fmt::F22s
+        | Fmt::F22c
+        | Fmt::F30t
+        | Fmt::F31t
+        | Fmt::F31i
+        | Fmt::F31c
+        | Fmt::F35c
+        | Fmt::F3rc
+        | Fmt::F51l
+        | Fmt::F45cc
+        | Fmt::F4rcc => Ok((u32::from(insns[pos + 1]), 0)),
     }
 }
 
-fn const_literal(insns: &[u8], pos: usize, fmt: u8, name: &str) -> (u32, String) {
+fn const_literal(insns: &[u8], pos: usize, fmt: Fmt, wide: bool) -> Result<(u32, String)> {
     match fmt {
-        FMT_11N => {
-            let a = (insns[pos + 1] & 0x0f) as u32;
-            let nibble = (insns[pos + 1] >> 4) as i32;
+        Fmt::F11n => {
+            let a = u32::from(insns[pos + 1] & 0x0f);
+            let nibble = i32::from(insns[pos + 1] >> 4);
             let value = if nibble & 0x8 != 0 {
                 nibble - 16
             } else {
                 nibble
             };
-            (a, value.to_string())
+            Ok((a, value.to_string()))
         }
-        FMT_21S => (insns[pos + 1] as u32, i16_at(insns, pos + 2).to_string()),
-        FMT_21H => {
-            let dest = insns[pos + 1] as u32;
-            let high = u32::from(u16_at(insns, pos + 2));
-            if name.contains("wide") {
-                (dest, format!("{}", (high as i64) << 48))
+        Fmt::F21s => Ok((
+            u32::from(insns[pos + 1]),
+            i16_at(insns, pos + 2)?.to_string(),
+        )),
+        Fmt::F21h => {
+            let dest = u32::from(insns[pos + 1]);
+            let high = u16_at(insns, pos + 2)?;
+            if wide {
+                Ok((dest, format!("{}", i64::from(high) << 48)))
             } else {
-                (dest, format!("{}", (high as i32) << 16))
+                Ok((dest, format!("{}", i32::from(high) << 16)))
             }
         }
-        FMT_31I => (insns[pos + 1] as u32, i32_at(insns, pos + 2).to_string()),
-        FMT_51L => (insns[pos + 1] as u32, i64_at(insns, pos + 2).to_string()),
-        _ => (insns[pos + 1] as u32, "0".to_string()),
+        Fmt::F31i => Ok((
+            u32::from(insns[pos + 1]),
+            i32_at(insns, pos + 2)?.to_string(),
+        )),
+        Fmt::F51l => Ok((
+            u32::from(insns[pos + 1]),
+            i64_at(insns, pos + 2)?.to_string(),
+        )),
+        Fmt::F10x
+        | Fmt::F12x
+        | Fmt::F11x
+        | Fmt::F10t
+        | Fmt::F20t
+        | Fmt::F22x
+        | Fmt::F21t
+        | Fmt::F21c
+        | Fmt::F23x
+        | Fmt::F22b
+        | Fmt::F22t
+        | Fmt::F22s
+        | Fmt::F22c
+        | Fmt::F32x
+        | Fmt::F30t
+        | Fmt::F31t
+        | Fmt::F31c
+        | Fmt::F35c
+        | Fmt::F3rc
+        | Fmt::F45cc
+        | Fmt::F4rcc => Ok((u32::from(insns[pos + 1]), "0".to_string())),
     }
 }
 
-fn lit_binop(insns: &[u8], pos: usize, fmt: u8) -> (u32, u32, i32) {
-    if fmt == FMT_22B {
-        let a = insns[pos + 1] as u32;
-        let b = insns[pos + 2] as u32;
-        let lit = insns[pos + 3] as i8 as i32;
-        (a, b, lit)
-    } else {
-        let a = (insns[pos + 1] & 0x0f) as u32;
-        let b = (insns[pos + 1] >> 4) as u32;
-        (a, b, i32::from(i16_at(insns, pos + 2)))
+fn lit_binop(insns: &[u8], pos: usize, fmt: Fmt) -> Result<(u32, u32, i32)> {
+    if let Fmt::F22b = fmt {
+        let a = u32::from(insns[pos + 1]);
+        let b = u32::from(insns[pos + 2]);
+        let lit = i32::from(insns[pos + 3] as i8);
+        return Ok((a, b, lit));
     }
+    let a = u32::from(insns[pos + 1] & 0x0f);
+    let b = u32::from(insns[pos + 1] >> 4);
+    Ok((a, b, i32::from(i16_at(insns, pos + 2)?)))
 }
 
-fn if_op(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "if-eq" => "==",
-        "if-ne" => "!=",
-        "if-lt" => "<",
-        "if-ge" => ">=",
-        "if-gt" => ">",
-        "if-le" => "<=",
-        "if-eqz" => "== 0",
-        "if-nez" => "!= 0",
-        "if-ltz" => "< 0",
-        "if-gez" => ">= 0",
-        "if-gtz" => "> 0",
-        "if-lez" => "<= 0",
-        _ => return None,
-    })
-}
-
-fn binary_symbol(name: &str) -> Option<&'static str> {
-    let base = name.split('/').next().unwrap_or(name);
-    let base = base.strip_prefix("rsub").map(|_| "rsub").unwrap_or(base);
-    Some(match base {
-        "add-int" | "add-long" | "add-float" | "add-double" => "+",
-        "sub-int" | "sub-long" | "sub-float" | "sub-double" | "rsub" => "-",
-        "mul-int" | "mul-long" | "mul-float" | "mul-double" => "*",
-        "div-int" | "div-long" | "div-float" | "div-double" => "/",
-        "rem-int" | "rem-long" | "rem-float" | "rem-double" => "%",
-        "and-int" | "and-long" => "&",
-        "or-int" | "or-long" => "|",
-        "xor-int" | "xor-long" => "^",
-        "shl-int" | "shl-long" => "<<",
-        "shr-int" | "shr-long" => ">>",
-        "ushr-int" | "ushr-long" => ">>>",
-        _ => return None,
-    })
-}
-
-fn member_mods(flags: u32, field: bool) -> String {
+fn member_mods(flags: u32, member: Member) -> String {
     let mut mods = String::new();
-    push_flag(&mut mods, flags, 0x1, "public");
-    push_flag(&mut mods, flags, 0x2, "private");
-    push_flag(&mut mods, flags, 0x4, "protected");
-    push_flag(&mut mods, flags, 0x8, "static");
-    push_flag(&mut mods, flags, 0x10, "final");
-    push_flag(&mut mods, flags, 0x20, "synchronized");
-    if field {
-        push_flag(&mut mods, flags, 0x40, "volatile");
-        push_flag(&mut mods, flags, 0x80, "transient");
-    } else {
-        push_flag(&mut mods, flags, 0x100, "native");
-        push_flag(&mut mods, flags, 0x400, "abstract");
+    push_flag(&mut mods, flags, ACC_PUBLIC, "public");
+    push_flag(&mut mods, flags, ACC_PRIVATE, "private");
+    push_flag(&mut mods, flags, ACC_PROTECTED, "protected");
+    push_flag(&mut mods, flags, ACC_STATIC, "static");
+    push_flag(&mut mods, flags, ACC_FINAL, "final");
+    push_flag(&mut mods, flags, ACC_SYNCHRONIZED, "synchronized");
+    match member {
+        Member::Field => {
+            push_flag(&mut mods, flags, ACC_VOLATILE, "volatile");
+            push_flag(&mut mods, flags, ACC_TRANSIENT, "transient");
+        }
+        Member::Method => {
+            push_flag(&mut mods, flags, ACC_NATIVE, "native");
+            push_flag(&mut mods, flags, ACC_ABSTRACT, "abstract");
+        }
     }
     mods
 }
@@ -595,24 +677,19 @@ fn reg_name(index: u32) -> String {
     format!("v{index}")
 }
 
-fn u16_at(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([data[off], data[off + 1]])
+fn i16_at(data: &[u8], off: usize) -> Result<i16> {
+    Ok(i16::from_le_bytes(u16_at(data, off)?.to_le_bytes()))
 }
 
-fn u32_at(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+fn i32_at(data: &[u8], off: usize) -> Result<i32> {
+    Ok(i32::from_le_bytes(u32_at(data, off)?.to_le_bytes()))
 }
 
-fn i16_at(data: &[u8], off: usize) -> i16 {
-    i16::from_le_bytes([data[off], data[off + 1]])
-}
-
-fn i32_at(data: &[u8], off: usize) -> i32 {
-    i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-}
-
-fn i64_at(data: &[u8], off: usize) -> i64 {
+fn i64_at(data: &[u8], off: usize) -> Result<i64> {
+    let bytes = data
+        .get(off..off + 8)
+        .ok_or_else(|| crate::Error::new(format!("truncated read at {off:#x}")))?;
     let mut buf = [0u8; 8];
-    buf.copy_from_slice(&data[off..off + 8]);
-    i64::from_le_bytes(buf)
+    buf.copy_from_slice(bytes);
+    Ok(i64::from_le_bytes(buf))
 }

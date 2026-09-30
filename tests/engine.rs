@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use asc::findrefs::{find_in_dex, MemberSel, RefQuery};
-use asc::{decompile_class, list_classes, manifest_xml, Options};
+use asc::{decompile_class, dump_apk, get_class_source, list_classes, manifest_xml, Options};
 
 #[path = "support.rs"]
 mod support;
@@ -283,6 +283,211 @@ fn manifest_roundtrip_through_apk() {
     );
     let saved = std::fs::read_to_string(&out).unwrap();
     assert!(saved.contains("<manifest"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn refs_after_switch_and_fill_array_payloads_are_kept() {
+    for kind in [1u8, 2, 3] {
+        let lines = find_in_dex(
+            "fixture.dex",
+            &support::make_payload_dex(kind),
+            &RefQuery::String("token".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec!["fixture.dex | Lexample/Test;->after | matched=(token)".to_string()],
+            "kind={kind}"
+        );
+    }
+}
+
+#[test]
+fn overlapping_buckets_keep_the_method_that_owns_the_instruction() {
+    let lines = find_in_dex(
+        "fixture.dex",
+        &support::make_bucket_overlap_dex(),
+        &RefQuery::String("token".into()),
+    )
+    .unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Lexample/Test;->kept")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn string_refs_follow_string_ids_when_data_is_not_in_index_order() {
+    let lines = find_in_dex(
+        "fixture.dex",
+        &support::make_reordered_string_dex(),
+        &RefQuery::String("token".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        lines,
+        vec!["fixture.dex | Lexample/Test;->m | matched=(mytoken)".to_string()]
+    );
+}
+
+#[test]
+fn member_names_do_not_match_substrings() {
+    let dex = support::make_field_named_dex(b"apiKey");
+    let precise = find_in_dex(
+        "fixture.dex",
+        &dex,
+        &RefQuery::Field(MemberSel {
+            class_name: Some("Lexample/Test;".into()),
+            fuzzy_class: false,
+            name: Some("a".into()),
+        }),
+    )
+    .unwrap();
+    assert!(precise.is_empty(), "{precise:?}");
+    let exact = find_in_dex(
+        "fixture.dex",
+        &dex,
+        &RefQuery::Field(MemberSel {
+            class_name: Some("example.Test".into()),
+            fuzzy_class: false,
+            name: Some("apiKey".into()),
+        }),
+    )
+    .unwrap();
+    assert_eq!(exact.len(), 1, "{exact:?}");
+    let unanchored = find_in_dex(
+        "fixture.dex",
+        &dex,
+        &RefQuery::Field(MemberSel {
+            class_name: None,
+            fuzzy_class: false,
+            name: Some("a".into()),
+        }),
+    )
+    .unwrap();
+    assert!(unanchored.is_empty(), "{unanchored:?}");
+    let regex = find_in_dex(
+        "fixture.dex",
+        &dex,
+        &RefQuery::Field(MemberSel {
+            class_name: Some("Test".into()),
+            fuzzy_class: true,
+            name: Some("api.*".into()),
+        }),
+    )
+    .unwrap();
+    assert_eq!(regex.len(), 1, "{regex:?}");
+}
+
+#[test]
+fn new_array_keeps_remaining_dimensions() {
+    let source = decompile_class(&support::make_array_dex(), "Lexample/Test;").unwrap();
+    assert!(source.contains("v0 = new int[][v1];"), "{source}");
+}
+
+#[test]
+fn root_dex_names_are_all_visible() {
+    let primary = support::make_class_only_dex(&["Lcom/app/Main;"], 0, b"035");
+    let extra = support::make_class_only_dex(&["Lcom/app/Payload;"], 0, b"035");
+    let hidden = support::make_class_only_dex(&["Lcom/app/Hidden;"], 0, b"035");
+    let dir = std::env::temp_dir().join(format!("asc-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apk = write_apk(
+        &dir,
+        "mixed.apk",
+        &[
+            ("classes.dex", primary.as_slice()),
+            ("payload.dex", extra.as_slice()),
+            ("assets/classes.dex", hidden.as_slice()),
+        ],
+        false,
+    );
+    let names = list_classes(&apk, None, &opts(2)).unwrap();
+    assert_eq!(
+        names,
+        vec![
+            "Lcom/app/Main;".to_string(),
+            "Lcom/app/Payload;".to_string()
+        ]
+    );
+    let only = write_apk(
+        &dir,
+        "secondary.apk",
+        &[("secondary.dex", extra.as_slice())],
+        true,
+    );
+    assert_eq!(
+        list_classes(&only, None, &opts(1)).unwrap(),
+        vec!["Lcom/app/Payload;".to_string()]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_class_follows_multidex_load_order() {
+    let early = support::make_marked_dex(b"from-classes2-longer");
+    let later = support::make_marked_dex(b"short");
+    let manifest = sample_manifest();
+    let dir = std::env::temp_dir().join(format!("asc-dup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apk = write_apk(
+        &dir,
+        "dup.apk",
+        &[
+            ("AndroidManifest.xml", manifest.as_slice()),
+            ("classes10.dex", later.as_slice()),
+            ("classes2.dex", early.as_slice()),
+        ],
+        false,
+    );
+    let source = get_class_source(&apk, "example.Test", &opts(4)).unwrap();
+    assert!(source.contains("from-classes2-longer"), "{source}");
+    assert!(!source.contains("\"short\""), "{source}");
+    let out = dir.join("tree");
+    let stats = dump_apk(&apk, &out, &opts(4)).unwrap();
+    assert_eq!(stats.classes, 1);
+    assert_eq!(stats.errors, 0);
+    let dumped = std::fs::read_to_string(out.join("example/Test.java")).unwrap();
+    assert!(dumped.contains("from-classes2-longer"), "{dumped}");
+    assert!(!dumped.contains("\"short\""), "{dumped}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn zip64_data_descriptor_and_crc_are_honored() {
+    let dex = support::make_class_only_dex(&["Lcom/app/Main;"], 0, b"035");
+    let dir = std::env::temp_dir().join(format!("asc-zip-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let zip64 = dir.join("zip64.apk");
+    std::fs::write(&zip64, support::zip64_stored("classes.dex", &dex)).unwrap();
+    assert_eq!(
+        list_classes(&zip64, None, &opts(1)).unwrap(),
+        vec!["Lcom/app/Main;".to_string()]
+    );
+    let described = dir.join("desc.apk");
+    std::fs::write(
+        &described,
+        support::zip_stored_flags("classes.dex", &dex, crc32fast::hash(&dex), 0x0008),
+    )
+    .unwrap();
+    assert_eq!(
+        list_classes(&described, None, &opts(1)).unwrap(),
+        vec!["Lcom/app/Main;".to_string()]
+    );
+    let zero = dir.join("zero.apk");
+    std::fs::write(&zero, support::zip_stored_flags("classes.dex", &dex, 0, 0)).unwrap();
+    assert_eq!(list_classes(&zero, None, &opts(1)).unwrap().len(), 1);
+    let bad = dir.join("bad.apk");
+    std::fs::write(
+        &bad,
+        support::zip_stored_flags("classes.dex", &dex, 0x00de_adbe, 0),
+    )
+    .unwrap();
+    let err = list_classes(&bad, None, &opts(1)).unwrap_err();
+    assert!(err.to_string().contains("crc mismatch"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
