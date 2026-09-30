@@ -1,7 +1,12 @@
 //! Android manifest decoder for binary XML and app-bundle protobuf XML.
 
-use crate::bytes::{u16_at, u32_at};
-use crate::Result;
+#[macro_use]
+mod error;
+mod bytes;
+
+pub use error::{Error, Result};
+
+use bytes::{u16_at, u32_at};
 
 pub fn manifest_xml(data: &[u8]) -> Result<String> {
     if data.len() >= 8 && u16_at(data, 0)? == 0x0003 {

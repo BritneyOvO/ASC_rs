@@ -71,10 +71,36 @@ dependencies = [
 name = "asc"
 version = "0.1.0"
 dependencies = [
+ "asc-apk",
+ "asc-dex",
  "clap",
  "crc32fast",
  "flate2",
+]
+
+[[package]]
+name = "asc-apk"
+version = "0.1.0"
+dependencies = [
+ "asc-axml",
+ "asc-dex",
+ "crc32fast",
+ "flate2",
  "memmap2",
+ "thiserror",
+]
+
+[[package]]
+name = "asc-axml"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "asc-dex"
+version = "0.1.0"
+dependencies = [
  "regex",
  "thiserror",
 ]

@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use crate::findrefs::{MemberSel, RefQuery};
-use crate::{dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options, Result};
+use asc_apk::{
+    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, MemberSel, Options,
+    RefQuery, Result,
+};
 
 #[derive(Parser)]
 #[command(

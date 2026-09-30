@@ -14,11 +14,13 @@ use std::time::Instant;
 use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
 
-use crate::axml::manifest_xml as decode_manifest;
-use crate::decompile::{decompile_class, decompile_class_def};
-use crate::dex::{normalize_dalvik_class, normalize_prefix, Dex};
-use crate::findrefs::{find_in_dex, RefQuery};
 use crate::{Error, Result};
+use asc_axml::manifest_xml as decode_manifest;
+use asc_dex::bytes;
+use asc_dex::{
+    decompile_class, decompile_class_def, find_in_dex, normalize_dalvik_class, normalize_prefix,
+    Dex, RefQuery,
+};
 
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -584,8 +586,8 @@ fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
     if sig != b"PK\x03\x04" {
         bail!("bad local header signature");
     }
-    let name_len = crate::bytes::u16_at(apk, off + 26)? as usize;
-    let extra_len = crate::bytes::u16_at(apk, off + 28)? as usize;
+    let name_len = bytes::u16_at(apk, off + 26)? as usize;
+    let extra_len = bytes::u16_at(apk, off + 28)? as usize;
     let data_off = off + 30 + name_len + extra_len;
     let comp_len = usize::try_from(compressed_size)
         .map_err(|_| Error::new(format!("compressed size for {name} exceeds this platform")))?;
@@ -643,7 +645,7 @@ fn logical_offsets(data: &[u8]) -> Vec<usize> {
     let mut offsets = Vec::new();
     let mut off = 0usize;
     while off + 0x70 <= data.len() && data.get(off..off + 8) == Some(b"dex\n041\0".as_slice()) {
-        let Ok(file_size) = crate::bytes::u32_at(data, off + 0x20) else {
+        let Ok(file_size) = bytes::u32_at(data, off + 0x20) else {
             break;
         };
         if file_size < 0x70 || off + file_size as usize > data.len() {
@@ -663,7 +665,7 @@ fn normalize_dex041(data: &[u8], header_off: usize) -> Result<Vec<u8>> {
     if header_off == 0 {
         return Ok(data.to_vec());
     }
-    let mut header_size = crate::bytes::u32_at(data, header_off + 0x24).unwrap_or(0x70) as usize;
+    let mut header_size = bytes::u32_at(data, header_off + 0x24).unwrap_or(0x70) as usize;
     if header_size < 0x70 || header_off + header_size > data.len() {
         header_size = 0x70;
     }
@@ -751,8 +753,8 @@ fn append_classes_heuristic(
 
 fn cd_bounds(apk: &[u8]) -> Result<(usize, usize)> {
     let eocd = find_eocd(apk).ok_or_else(|| Error::new("EOCD not found"))?;
-    let cd_size_32 = crate::bytes::u32_at(apk, eocd + 12)?;
-    let cd_off_32 = crate::bytes::u32_at(apk, eocd + 16)?;
+    let cd_size_32 = bytes::u32_at(apk, eocd + 12)?;
+    let cd_off_32 = bytes::u32_at(apk, eocd + 16)?;
     let (cd_off, cd_size) = if cd_size_32 == u32::MAX || cd_off_32 == u32::MAX {
         zip64_cd_bounds(apk, eocd)?
     } else {
@@ -776,13 +778,13 @@ fn zip64_cd_bounds(apk: &[u8], eocd: usize) -> Result<(u64, u64)> {
         bail!("ZIP64 locator not found");
     }
     let loc = eocd - 20;
-    let eocd64 = crate::bytes::u64_at(apk, loc + 8)?;
+    let eocd64 = bytes::u64_at(apk, loc + 8)?;
     let at = usize::try_from(eocd64).map_err(|_| Error::new("ZIP64 EOCD offset is too large"))?;
     if apk.get(at..at + 4) != Some(b"PK\x06\x06") || at + 56 > apk.len() {
         bail!("ZIP64 EOCD not found");
     }
-    let cd_size = crate::bytes::u64_at(apk, at + 40)?;
-    let cd_off = crate::bytes::u64_at(apk, at + 48)?;
+    let cd_size = bytes::u64_at(apk, at + 40)?;
+    let cd_off = bytes::u64_at(apk, at + 48)?;
     Ok((cd_off, cd_size))
 }
 
@@ -812,15 +814,15 @@ fn read_cd_record(
     if header + 46 > cd_end || apk.get(header..header + 4) != Some(b"PK\x01\x02") {
         return Ok(None);
     }
-    let method = crate::bytes::u16_at(apk, header + 10)?;
-    let crc = crate::bytes::u32_at(apk, header + 16)?;
-    let comp_size = u64::from(crate::bytes::u32_at(apk, header + 20)?);
-    let uncomp_size = u64::from(crate::bytes::u32_at(apk, header + 24)?);
-    let name_len = crate::bytes::u16_at(apk, header + 28)? as usize;
-    let extra_len = crate::bytes::u16_at(apk, header + 30)? as usize;
-    let comment_len = crate::bytes::u16_at(apk, header + 32)? as usize;
-    let disk = crate::bytes::u16_at(apk, header + 34)?;
-    let local_off = u64::from(crate::bytes::u32_at(apk, header + 42)?);
+    let method = bytes::u16_at(apk, header + 10)?;
+    let crc = bytes::u32_at(apk, header + 16)?;
+    let comp_size = u64::from(bytes::u32_at(apk, header + 20)?);
+    let uncomp_size = u64::from(bytes::u32_at(apk, header + 24)?);
+    let name_len = bytes::u16_at(apk, header + 28)? as usize;
+    let extra_len = bytes::u16_at(apk, header + 30)? as usize;
+    let comment_len = bytes::u16_at(apk, header + 32)? as usize;
+    let disk = bytes::u16_at(apk, header + 34)?;
+    let local_off = u64::from(bytes::u32_at(apk, header + 42)?);
     let name_start = header + 46;
     let extra_start = name_start + name_len;
     let extra_end = extra_start + extra_len;

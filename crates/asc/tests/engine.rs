@@ -1,9 +1,7 @@
 use std::process::Command;
 
-use asc::findrefs::{find_in_dex, MemberSel, RefQuery};
-use asc::{
-    decompile_class, dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options,
-};
+use asc_apk::{dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options};
+use asc_dex::{decompile_class, find_in_dex, MemberSel, RefQuery};
 
 #[path = "support.rs"]
 mod support;

@@ -1,0 +1,11 @@
+[package]
+name = "asc-dex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DEX parser, instruction lifter, and reference search"
+
+[dependencies]
+regex.workspace = true
+thiserror.workspace = true

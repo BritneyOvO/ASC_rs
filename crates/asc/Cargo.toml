@@ -1,0 +1,21 @@
+[package]
+name = "asc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fast Android decompiler front-end for agents and mobile researchers"
+readme = "../../README.md"
+
+[[bin]]
+name = "asc"
+path = "src/main.rs"
+
+[dependencies]
+asc-apk.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+asc-dex.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true

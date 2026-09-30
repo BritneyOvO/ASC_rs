@@ -1,5 +1,7 @@
+mod cli;
+
 fn main() {
-    let code = asc::cli::run();
+    let code = cli::run();
     if code != 0 {
         std::process::exit(code);
     }

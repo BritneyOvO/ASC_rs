@@ -1,0 +1,15 @@
+[package]
+name = "asc-apk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "APK and Android App Bundle access for ASC"
+
+[dependencies]
+asc-axml.workspace = true
+asc-dex.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true

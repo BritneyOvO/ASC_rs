@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Recoverable analysis or I/O failure. The CLI prints this as `Error: ...`.
+/// Recoverable archive, manifest, or DEX failure surfaced by the commands.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("failed to {action} {path}: {source}")]
@@ -12,8 +12,10 @@ pub enum Error {
     },
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("invalid pattern: {0}")]
-    Pattern(#[from] regex::Error),
+    #[error(transparent)]
+    Dex(#[from] asc_dex::Error),
+    #[error(transparent)]
+    Manifest(#[from] asc_axml::Error),
     #[error("{0}")]
     Message(String),
 }
@@ -26,7 +28,6 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[macro_export]
 macro_rules! bail {
     ($($arg:tt)*) => {
         return Err($crate::Error::new(format!($($arg)*)))
