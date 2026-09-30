@@ -79,8 +79,30 @@ struct InsnLocator {
 }
 
 pub fn find_in_dex(dex_name: &str, data: &[u8], query: &RefQuery) -> Result<Vec<String>> {
+    find_in_dex_inner(dex_name, data, query, None)
+}
+
+/// Same as [`find_in_dex`], but string hits are tested and printed after `resolve`.
+///
+/// A string pool entry can be a resource token such as `@string/app_name`. The
+/// container passes the resource table in so a search for the real value still hits.
+pub fn find_in_dex_resolved(
+    dex_name: &str,
+    data: &[u8],
+    query: &RefQuery,
+    resolve: &dyn Fn(&str) -> String,
+) -> Result<Vec<String>> {
+    find_in_dex_inner(dex_name, data, query, Some(resolve))
+}
+
+fn find_in_dex_inner(
+    dex_name: &str,
+    data: &[u8],
+    query: &RefQuery,
+    resolve: Option<&dyn Fn(&str) -> String>,
+) -> Result<Vec<String>> {
     let dex = Dex::parse(data)?;
-    let (kind, idxs) = resolve(&dex, query)?;
+    let (kind, idxs) = resolve_query(&dex, query, resolve)?;
     if idxs.is_empty() {
         return Ok(Vec::new());
     }
@@ -100,7 +122,7 @@ pub fn find_in_dex(dex_name: &str, data: &[u8], query: &RefQuery) -> Result<Vec<
         let method = dex.format_method(method_idx)?;
         let rendered = matched
             .into_iter()
-            .map(|idx| format_matched(&dex, kind, idx))
+            .map(|idx| format_matched(&dex, kind, idx, resolve))
             .collect::<Result<Vec<_>>>()?
             .join("; ");
         lines.push(format!("{dex_name} | {method} | matched=({rendered})"));
@@ -108,22 +130,41 @@ pub fn find_in_dex(dex_name: &str, data: &[u8], query: &RefQuery) -> Result<Vec<
     Ok(lines)
 }
 
-fn resolve(dex: &Dex, query: &RefQuery) -> Result<(Kind, HashSet<u32>)> {
+fn resolve_query(
+    dex: &Dex,
+    query: &RefQuery,
+    resolve: Option<&dyn Fn(&str) -> String>,
+) -> Result<(Kind, HashSet<u32>)> {
     match query {
-        RefQuery::String(pattern) => Ok((Kind::String, locate_strings(dex, pattern)?)),
+        RefQuery::String(pattern) => Ok((Kind::String, locate_strings(dex, pattern, resolve)?)),
         RefQuery::Type(pattern) => Ok((Kind::Type, locate_types(dex, pattern)?)),
         RefQuery::Method(sel) => Ok((Kind::Method, locate_members(dex, sel, true)?)),
         RefQuery::Field(sel) => Ok((Kind::Field, locate_members(dex, sel, false)?)),
     }
 }
 
-fn format_matched(dex: &Dex, kind: Kind, idx: u32) -> Result<String> {
+fn format_matched(
+    dex: &Dex,
+    kind: Kind,
+    idx: u32,
+    resolve: Option<&dyn Fn(&str) -> String>,
+) -> Result<String> {
     match kind {
-        Kind::String => dex.string(idx),
+        Kind::String => {
+            let raw = dex.string(idx)?;
+            Ok(match resolve {
+                Some(resolve) if has_at_ref(raw.as_bytes()) => resolve(&raw),
+                _ => raw,
+            })
+        }
         Kind::Type => dex.type_desc(idx),
         Kind::Method => dex.format_method(idx),
         Kind::Field => dex.format_field(idx),
     }
+}
+
+fn has_at_ref(bytes: &[u8]) -> bool {
+    bytes.iter().any(|byte| *byte == b'@' || *byte == b'?')
 }
 
 fn byte_regex(pattern: &str) -> Result<regex::bytes::Regex> {
@@ -137,7 +178,11 @@ fn anchored_regex(pattern: &str) -> Result<regex::bytes::Regex> {
     byte_regex(&format!(r"\A(?:{pattern})\z"))
 }
 
-fn locate_strings(dex: &Dex, pattern: &str) -> Result<HashSet<u32>> {
+fn locate_strings(
+    dex: &Dex,
+    pattern: &str,
+    resolve: Option<&dyn Fn(&str) -> String>,
+) -> Result<HashSet<u32>> {
     let size = dex.header.string_ids_size;
     if size == 0 || pattern.is_empty() {
         return Ok(HashSet::new());
@@ -148,6 +193,18 @@ fn locate_strings(dex: &Dex, pattern: &str) -> Result<HashSet<u32>> {
         let bytes = dex.string_bytes(idx)?;
         if regex.is_match(bytes) {
             found.insert(idx);
+            continue;
+        }
+        let Some(resolve) = resolve else {
+            continue;
+        };
+        if !has_at_ref(bytes) {
+            continue;
+        }
+        let shown = String::from_utf8_lossy(bytes);
+        let resolved = resolve(shown.as_ref());
+        if resolved != shown && regex.is_match(resolved.as_bytes()) {
+            found.insert(idx);
         }
     }
     Ok(found)
@@ -157,7 +214,7 @@ fn locate_types(dex: &Dex, pattern: &str) -> Result<HashSet<u32>> {
     if pattern.is_empty() {
         return Ok(HashSet::new());
     }
-    let strings = locate_strings(dex, pattern)?;
+    let strings = locate_strings(dex, pattern, None)?;
     let mut by_string: HashMap<u32, Vec<u32>> = HashMap::new();
     for type_idx in 0..dex.header.type_ids_size {
         let string_idx = dex.type_string_idx(type_idx)?;

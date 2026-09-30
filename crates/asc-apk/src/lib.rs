@@ -7,6 +7,7 @@
 mod error;
 
 mod apk;
+mod arsc;
 
 pub use apk::{
     dump_apk, find_refs, get_class_source, list_classes, manifest_xml, DumpStats, Options,

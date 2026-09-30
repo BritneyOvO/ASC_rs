@@ -18,8 +18,8 @@ use crate::{Error, Result};
 use asc_axml::manifest_xml as decode_manifest;
 use asc_dex::bytes;
 use asc_dex::{
-    decompile_class, decompile_class_def, find_in_dex, normalize_dalvik_class, normalize_prefix,
-    Dex, RefQuery,
+    decompile_class, decompile_class_def, find_in_dex_resolved, normalize_dalvik_class,
+    normalize_prefix, Dex, RefQuery,
 };
 
 #[derive(Clone, Debug)]
@@ -127,14 +127,20 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
             entries.len()
         );
     }
-    let hit = find_defining_dex(&map, &entries, descriptor.as_bytes(), options)?;
-    let Some((dex_name, dex_buf)) = hit else {
+    let (hit, resources) = std::thread::scope(|scope| {
+        let load = scope.spawn(|| load_resource_table(&map));
+        let hit = find_defining_dex(&map, &entries, descriptor.as_bytes(), options);
+        (hit, load.join().expect("resource table loader panicked"))
+    });
+    let Some((dex_name, dex_buf)) = hit? else {
         bail!("Class {descriptor} not found in APK.");
     };
     if options.debug {
         eprintln!("[DEBUG] Hit DEX: {dex_name}");
     }
-    let source = decompile_class(&dex_buf, &descriptor)?;
+    let source = resources
+        .rewrite_code(&decompile_class(&dex_buf, &descriptor)?)
+        .into_owned();
     if options.debug {
         eprintln!(
             "[DEBUG] Total Execution Time: {:.2} us",
@@ -148,9 +154,10 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     check_threads(options.threads)?;
     let started = Instant::now();
     fs::create_dir_all(out_dir)?;
-    let xml = manifest_xml(path)?;
-    fs::write(out_dir.join("AndroidManifest.xml"), xml)?;
     let (_file, map) = open_apk(path)?;
+    let resources = load_resource_table(&map);
+    let xml = manifest_text(&map, &resources)?;
+    fs::write(out_dir.join("AndroidManifest.xml"), xml)?;
     let entries = parse_cd_dex_entries(&map)?;
     if entries.is_empty() {
         return Ok(DumpStats::default());
@@ -165,6 +172,7 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
             options,
             ranks[index],
             &claims,
+            &resources,
         )
     })?;
     let total = DumpStats {
@@ -190,6 +198,7 @@ fn dump_dex_entry(
     options: &Options,
     rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
     let mut errors = 0usize;
@@ -219,8 +228,9 @@ fn dump_dex_entry(
             };
             match decompile_class_def(&dex, &def) {
                 Ok(source) => {
+                    let rewritten = resources.rewrite_code(&source);
                     let dest = class_output_path(out_dir, &class_desc);
-                    publish_class(claims, &dest, rank, &source)?;
+                    publish_class(claims, &dest, rank, rewritten.as_ref())?;
                 }
                 Err(err) => {
                     errors += 1;
@@ -360,6 +370,7 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
             .then(left.name.cmp(&right.name))
             .then(left.local_header_off.cmp(&right.local_header_off))
     });
+    let resources = load_resource_table(&map);
     let groups = run_indexed(entries.len(), options.threads, |index| {
         let entry = &entries[index];
         let t0 = Instant::now();
@@ -367,7 +378,9 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
         let inflated = t0.elapsed();
         let mut lines = Vec::new();
         for (name, buf) in logical_buffers(&entry.name, data)? {
-            lines.extend(find_in_dex(&name, &buf, query)?);
+            lines.extend(find_in_dex_resolved(&name, &buf, query, &|text| {
+                resources.rewrite_plain(text)
+            })?);
         }
         if options.debug {
             eprintln!(
@@ -387,17 +400,92 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
             options.threads.min(entries.len().max(1))
         );
     }
-    Ok(groups.into_iter().flatten().collect())
+    Ok(groups
+        .into_iter()
+        .flatten()
+        .map(|line| present_ref_line(&resources, query, &line))
+        .collect())
 }
 
 pub fn manifest_xml(path: &Path) -> Result<String> {
     let (_file, map) = open_apk(path)?;
-    let bytes = read_zip_entry(&map, "AndroidManifest.xml")?;
-    let mut xml = decode_manifest(&bytes)?;
+    let resources = load_resource_table(&map);
+    manifest_text(&map, &resources)
+}
+
+fn manifest_text(apk: &[u8], resources: &crate::arsc::ResourceTable) -> Result<String> {
+    let bytes = read_zip_entry(apk, "AndroidManifest.xml")?;
+    let mut xml = resources.annotate(&decode_manifest(&bytes)?);
     if !xml.ends_with('\n') {
         xml.push('\n');
     }
     Ok(xml)
+}
+
+fn load_resource_table(apk: &[u8]) -> crate::arsc::ResourceTable {
+    let Ok(entries) = all_zip_entries(apk) else {
+        return crate::arsc::ResourceTable::default();
+    };
+    let mut table = crate::arsc::ResourceTable::default();
+    for name in [
+        b"resources.arsc".as_slice(),
+        b"base/resources.arsc".as_slice(),
+    ] {
+        let Some(entry) = entries.iter().find(|entry| entry.name.as_slice() == name) else {
+            continue;
+        };
+        let label = String::from_utf8_lossy(&entry.name).into_owned();
+        match inflate_entry(apk, entry) {
+            Ok(bytes) => match crate::arsc::ResourceTable::parse(&bytes) {
+                Ok(parsed) => table.extend(parsed),
+                Err(err) => eprintln!("warning: {label}: {err}"),
+            },
+            Err(err) => eprintln!("warning: {label}: {err}"),
+        }
+    }
+    for entry in &entries {
+        if let Ok(name) = std::str::from_utf8(&entry.name) {
+            table.note_res_path(name);
+        }
+    }
+    table
+}
+
+fn present_ref_line(
+    resources: &crate::arsc::ResourceTable,
+    query: &RefQuery,
+    line: &str,
+) -> String {
+    if matches!(query, RefQuery::String(_)) {
+        return line.to_string();
+    }
+    let Some((head, tail)) = line.split_once("matched=(") else {
+        return line.to_string();
+    };
+    let Some(body) = tail.strip_suffix(')') else {
+        return line.to_string();
+    };
+    format!("{head}matched=({})", resources.rewrite_code(body))
+}
+
+fn all_zip_entries(apk: &[u8]) -> Result<Vec<ZipEntry>> {
+    let (start, end) = cd_bounds(apk)?;
+    walk_central_directory(apk, start, end)
+}
+
+fn inflate_entry(apk: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
+    let name = String::from_utf8_lossy(&entry.name).into_owned();
+    inflate_bytes(
+        apk,
+        ZipBytes {
+            name: &name,
+            method: entry.method,
+            crc: entry.crc,
+            compressed_size: entry.comp_size,
+            uncompressed_size: entry.uncomp_size,
+            header_offset: entry.local_header_off,
+        },
+    )
 }
 
 fn check_threads(threads: usize) -> Result<()> {

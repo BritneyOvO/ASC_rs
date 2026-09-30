@@ -71,11 +71,21 @@ dependencies = [
 name = "asc"
 version = "0.1.0"
 dependencies = [
+ "asc-abc",
  "asc-apk",
  "asc-dex",
+ "asc-hap",
  "clap",
  "crc32fast",
  "flate2",
+]
+
+[[package]]
+name = "asc-abc"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "thiserror",
 ]
 
 [[package]]
@@ -102,6 +112,17 @@ name = "asc-dex"
 version = "0.1.0"
 dependencies = [
  "regex",
+ "thiserror",
+]
+
+[[package]]
+name = "asc-hap"
+version = "0.1.0"
+dependencies = [
+ "asc-abc",
+ "crc32fast",
+ "flate2",
+ "memmap2",
  "thiserror",
 ]
 

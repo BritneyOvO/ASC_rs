@@ -12,6 +12,8 @@ name = "asc"
 path = "src/main.rs"
 
 [dependencies]
+asc-abc.workspace = true
+asc-hap.workspace = true
 asc-apk.workspace = true
 clap.workspace = true
 

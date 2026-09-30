@@ -1,13 +1,15 @@
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 
+use asc_abc::{class_names, class_text, find_members, find_strings, find_types, is_abc};
 use asc_apk::{
-    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, MemberSel, Options,
+    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Error, MemberSel, Options,
     RefQuery, Result,
 };
+use asc_hap::{self, Query};
 
 #[derive(Parser)]
 #[command(
@@ -159,7 +161,14 @@ fn execute(cli: Cli) -> Result<()> {
             apk_path,
             dalvik_class,
         } => {
-            let source = get_class_source(&apk_path, &dalvik_class, &Options { threads, debug })?;
+            let source = if let Some(data) = read_abc(&apk_path)? {
+                class_text(&data, &dalvik_class).map_err(abc_err)?
+            } else if hap_file(&apk_path)? {
+                asc_hap::get_class_source(&apk_path, &dalvik_class, &hap_options(threads, debug))
+                    .map_err(hap_err)?
+            } else {
+                get_class_source(&apk_path, &dalvik_class, &Options { threads, debug })?
+            };
             emit(&source, output.as_deref(), true)?;
         }
         Commands::Listclass {
@@ -169,7 +178,14 @@ fn execute(cli: Cli) -> Result<()> {
             output,
             apk_path,
         } => {
-            let names = list_classes(&apk_path, prefix.as_deref(), &Options { threads, debug })?;
+            let names = if let Some(data) = read_abc(&apk_path)? {
+                class_names(&data, prefix.as_deref()).map_err(abc_err)?
+            } else if hap_file(&apk_path)? {
+                asc_hap::list_classes(&apk_path, prefix.as_deref(), &hap_options(threads, debug))
+                    .map_err(hap_err)?
+            } else {
+                list_classes(&apk_path, prefix.as_deref(), &Options { threads, debug })?
+            };
             let text = if names.is_empty() {
                 String::new()
             } else {
@@ -187,6 +203,14 @@ fn execute(cli: Cli) -> Result<()> {
             output,
             apk_path,
         } => {
+            if read_abc(&apk_path)?.is_some() {
+                return Err(Error::new("ABC files have no AndroidManifest.xml"));
+            }
+            if hap_file(&apk_path)? {
+                let text = asc_hap::module_json(&apk_path).map_err(hap_err)?;
+                emit(&text, output.as_deref(), true)?;
+                return Ok(());
+            }
             let started = std::time::Instant::now();
             let xml = manifest_xml(&apk_path)?;
             emit(&xml, output.as_deref(), true)?;
@@ -203,6 +227,20 @@ fn execute(cli: Cli) -> Result<()> {
             output,
             apk_path,
         } => {
+            if read_abc(&apk_path)?.is_some() {
+                return Err(Error::new("dump does not read ABC files"));
+            }
+            if hap_file(&apk_path)? {
+                let stats = asc_hap::dump_hap(&apk_path, &output, &hap_options(threads, debug))
+                    .map_err(hap_err)?;
+                eprintln!(
+                    "dumped {} classes ({} errors) -> {}",
+                    stats.classes,
+                    stats.errors,
+                    output.display()
+                );
+                return Ok(());
+            }
             let started = std::time::Instant::now();
             let stats = dump_apk(&apk_path, &output, &Options { threads, debug })?;
             eprintln!(
@@ -254,7 +292,14 @@ fn execute(cli: Cli) -> Result<()> {
                     output,
                 ),
             };
-            let lines = find_refs(&apk_path, &query, &Options { threads, debug })?;
+            let lines = if let Some(data) = read_abc(&apk_path)? {
+                abc_refs(&data, &apk_path, &query)?
+            } else if hap_file(&apk_path)? {
+                asc_hap::find_refs(&apk_path, hap_query(&query), &hap_options(threads, debug))
+                    .map_err(hap_err)?
+            } else {
+                find_refs(&apk_path, &query, &Options { threads, debug })?
+            };
             let text = if lines.is_empty() {
                 String::new()
             } else {
@@ -264,6 +309,77 @@ fn execute(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn read_abc(path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut file = File::open(path).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut magic = [0u8; 8];
+    let read = file.read(&mut magic).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    if read < 8 || !is_abc(&magic) {
+        return Ok(None);
+    }
+    let mut data = Vec::from(magic);
+    file.read_to_end(&mut data)
+        .map_err(|source| Error::IoPath {
+            action: "open",
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(Some(data))
+}
+
+fn abc_err(err: asc_abc::Error) -> Error {
+    Error::new(err.to_string())
+}
+
+fn hap_err(err: asc_hap::Error) -> Error {
+    Error::new(err.to_string())
+}
+
+fn hap_file(path: &Path) -> Result<bool> {
+    asc_hap::is_hap(path).map_err(hap_err)
+}
+
+fn hap_options(threads: usize, debug: bool) -> asc_hap::Options {
+    asc_hap::Options { threads, debug }
+}
+
+fn hap_query(query: &RefQuery) -> Query<'_> {
+    match query {
+        RefQuery::String(pattern) => Query::String(pattern),
+        RefQuery::Type(pattern) => Query::Type(pattern),
+        RefQuery::Method(sel) => Query::Method {
+            name: sel.name.as_deref(),
+            class_name: sel.class_name.as_deref(),
+        },
+        RefQuery::Field(sel) => Query::Field {
+            name: sel.name.as_deref(),
+            class_name: sel.class_name.as_deref(),
+        },
+    }
+}
+
+fn abc_refs(data: &[u8], path: &Path, query: &RefQuery) -> Result<Vec<String>> {
+    let file = path.display().to_string();
+    match query {
+        RefQuery::String(pattern) => find_strings(data, &file, pattern).map_err(abc_err),
+        RefQuery::Type(pattern) => find_types(data, &file, pattern).map_err(abc_err),
+        RefQuery::Method(sel) => abc_members(data, &file, true, sel),
+        RefQuery::Field(sel) => abc_members(data, &file, false, sel),
+    }
+}
+
+fn abc_members(data: &[u8], file: &str, methods: bool, sel: &MemberSel) -> Result<Vec<String>> {
+    let pattern = sel.name.as_deref().unwrap_or(".*");
+    find_members(data, file, methods, pattern, sel.class_name.as_deref()).map_err(abc_err)
 }
 
 fn emit(text: &str, output: Option<&std::path::Path>, ensure_newline: bool) -> Result<()> {
