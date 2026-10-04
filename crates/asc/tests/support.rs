@@ -106,6 +106,139 @@ pub fn make_dex() -> Vec<u8> {
     make_marked_dex(b"token")
 }
 
+/// Static `String read()` that returns `token`, so a decompiler has to keep
+/// the literal.
+pub fn make_return_string_dex(token: &[u8]) -> Vec<u8> {
+    let strings: [&[u8]; 6] = [
+        b"Lexample/Test;",
+        b"Ljava/lang/Object;",
+        b"Ljava/lang/String;",
+        b"L",
+        b"read",
+        token,
+    ];
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
+    let type_ids = builder.section(2, 3, &pack_u32s(&[0, 1, 2]), 4);
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[3, 2, 0]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, 4);
+    let method_ids = builder.section(5, 1, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    let string_ids = write_string_payload(&mut builder, string_ids, &strings);
+    let code_body = {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&3u32.to_le_bytes());
+        // const-string v0, string@5; return-object v0
+        body.extend_from_slice(&[0x1a, 0x00, 0x05, 0x00, 0x11, 0x00]);
+        body
+    };
+    let code = builder.section(0x2001, 1, &code_body, 4);
+    let mut class_data = vec![0, 0, 1, 0];
+    class_data.extend_from_slice(&[0x00, 0x09]);
+    class_data.extend(uleb(code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 12, 0);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 20, 0);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    put_u32(&mut builder.buf, class_defs + 28, 0);
+    let _ = string_ids;
+    builder.finish(
+        strings.len(),
+        string_ids,
+        3,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        1,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
+/// Static `int choose(int)` with a real `if-eqz` on the parameter.
+pub fn make_branch_dex() -> Vec<u8> {
+    let strings: [&[u8]; 5] = [
+        b"Lexample/Test;",
+        b"Ljava/lang/Object;",
+        b"I",
+        b"II",
+        b"choose",
+    ];
+    let mut builder = DexBuilder::new();
+    let string_ids = builder.section(1, strings.len() as u32, &vec![0; 4 * strings.len()], 4);
+    let type_ids = builder.section(2, 3, &pack_u32s(&[0, 1, 2]), 4);
+    let mut type_list = Vec::new();
+    type_list.extend_from_slice(&1u32.to_le_bytes());
+    type_list.extend_from_slice(&2u16.to_le_bytes());
+    type_list.extend_from_slice(&0u16.to_le_bytes());
+    let params_off = builder.section(0x1001, 1, &type_list, 4) as u32;
+    let proto_ids = builder.section(3, 1, &pack_u32s(&[3, 2, params_off]), 4);
+    let mut methods = Vec::new();
+    put_method(&mut methods, 0, 0, 4);
+    let method_ids = builder.section(5, 1, &methods, 4);
+    let class_defs = builder.section(6, 1, &[0; 32], 4);
+    let data_off = builder.buf.len();
+    let string_ids = write_string_payload(&mut builder, string_ids, &strings);
+    let code_body = {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&6u32.to_le_bytes());
+        // if-eqz v0, +4; const/4 v0, #1; return v0; const/4 v0, #2; return v0
+        body.extend_from_slice(&[
+            0x38, 0x00, 0x04, 0x00, 0x12, 0x10, 0x0f, 0x00, 0x12, 0x20, 0x0f, 0x00,
+        ]);
+        body
+    };
+    let code = builder.section(0x2001, 1, &code_body, 4);
+    let mut class_data = vec![0, 0, 1, 0];
+    class_data.extend_from_slice(&[0x00, 0x09]);
+    class_data.extend(uleb(code));
+    let class_data_off = builder.section(0x2000, 1, &class_data, 1);
+    put_u32(&mut builder.buf, class_defs, 0);
+    put_u32(&mut builder.buf, class_defs + 4, 1);
+    put_u32(&mut builder.buf, class_defs + 8, 1);
+    put_u32(&mut builder.buf, class_defs + 12, 0);
+    put_u32(&mut builder.buf, class_defs + 16, 0xffff_ffff);
+    put_u32(&mut builder.buf, class_defs + 20, 0);
+    put_u32(&mut builder.buf, class_defs + 24, class_data_off as u32);
+    put_u32(&mut builder.buf, class_defs + 28, 0);
+    let _ = string_ids;
+    builder.finish(
+        strings.len(),
+        string_ids,
+        3,
+        type_ids,
+        1,
+        proto_ids,
+        0,
+        0,
+        1,
+        method_ids,
+        1,
+        class_defs,
+        data_off,
+    )
+}
+
 pub fn make_marked_dex(token: &[u8]) -> Vec<u8> {
     let strings: [&[u8]; 6] = [
         b"Lexample/Test;",

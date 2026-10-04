@@ -1,7 +1,9 @@
 use std::process::Command;
 
-use asc_apk::{dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Options};
-use asc_dex::{decompile_class, find_in_dex, MemberSel, RefQuery};
+use asc_apk::{
+    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Engine, Options,
+};
+use asc_dex::{find_in_dex, smali_class, MemberSel, RefQuery};
 
 #[path = "support.rs"]
 mod support;
@@ -10,6 +12,15 @@ fn opts(threads: usize) -> Options {
     Options {
         threads,
         debug: false,
+        engine: Engine::Ddc,
+    }
+}
+
+fn smali_opts(threads: usize) -> Options {
+    Options {
+        threads,
+        debug: false,
+        engine: Engine::Smali,
     }
 }
 
@@ -104,11 +115,13 @@ fn class_without_method_bodies_has_no_references() {
 
 #[test]
 fn decompile_prints_class_and_methods() {
-    let source = decompile_class(&support::make_dex(), "Lexample/Test;").unwrap();
-    assert!(source.contains("class Test"), "{source}");
-    assert!(source.contains("void first()"), "{source}");
-    assert!(source.contains("void second()"), "{source}");
-    assert!(source.contains("v0 = \"token\";"), "{source}");
+    let source = smali_class(&support::make_dex(), "Lexample/Test;").unwrap();
+    assert!(source.contains(".class public Lexample/Test;"), "{source}");
+    assert!(source.contains(".method public static first()V"), "{source}");
+    assert!(source.contains(".method public static second()V"), "{source}");
+    assert!(source.contains("const-string v0, \"token\""), "{source}");
+    assert!(source.contains("return-void"), "{source}");
+    assert!(source.contains(".end method"), "{source}");
 }
 
 #[test]
@@ -384,8 +397,8 @@ fn member_names_do_not_match_substrings() {
 
 #[test]
 fn new_array_keeps_remaining_dimensions() {
-    let source = decompile_class(&support::make_array_dex(), "Lexample/Test;").unwrap();
-    assert!(source.contains("v0 = new int[][v1];"), "{source}");
+    let source = smali_class(&support::make_array_dex(), "Lexample/Test;").unwrap();
+    assert!(source.contains("new-array v0, p0, [[I"), "{source}");
 }
 
 #[test]
@@ -443,14 +456,14 @@ fn duplicate_class_follows_multidex_load_order() {
         ],
         false,
     );
-    let source = get_class_source(&apk, "example.Test", &opts(4)).unwrap();
+    let source = get_class_source(&apk, "example.Test", &smali_opts(4)).unwrap();
     assert!(source.contains("from-classes2-longer"), "{source}");
     assert!(!source.contains("\"short\""), "{source}");
     let out = dir.join("tree");
-    let stats = dump_apk(&apk, &out, &opts(4)).unwrap();
+    let stats = dump_apk(&apk, &out, &smali_opts(4)).unwrap();
     assert_eq!(stats.classes, 1);
     assert_eq!(stats.errors, 0);
-    let dumped = std::fs::read_to_string(out.join("example/Test.java")).unwrap();
+    let dumped = std::fs::read_to_string(out.join("example/Test.smali")).unwrap();
     assert!(dumped.contains("from-classes2-longer"), "{dumped}");
     assert!(!dumped.contains("\"short\""), "{dumped}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -541,7 +554,7 @@ fn aab_duplicate_class_prefers_base_then_classes_ordinal() {
         ],
         false,
     );
-    let source = get_class_source(&aab, "example.Test", &opts(4)).unwrap();
+    let source = get_class_source(&aab, "example.Test", &smali_opts(4)).unwrap();
     assert!(source.contains("from-base-module!"), "{source}");
     assert!(!source.contains("from-feature-mod"), "{source}");
     let lines = find_refs(&aab, &RefQuery::String("from-feature-mod".into()), &opts(2)).unwrap();
@@ -558,10 +571,155 @@ fn aab_duplicate_class_prefers_base_then_classes_ordinal() {
         ],
         false,
     );
-    let source = get_class_source(&ordered, "example.Test", &opts(2)).unwrap();
+    let source = get_class_source(&ordered, "example.Test", &smali_opts(2)).unwrap();
     assert!(source.contains("from-classes2-longer"), "{source}");
     assert!(!source.contains("\"short\""), "{source}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ddc_getclass_prints_structured_java() {
+    let dir = std::env::temp_dir().join(format!("asc-ddc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let straight = write_apk(
+        &dir,
+        "straight.apk",
+        &[("classes.dex", support::make_dex().as_slice())],
+        false,
+    );
+    let source = get_class_source(&straight, "example.Test", &opts(2)).unwrap();
+    assert!(source.contains("class Test"), "{source}");
+    assert!(source.contains("first"), "{source}");
+    assert!(source.contains("second"), "{source}");
+    assert!(!source.contains("const-string"), "{source}");
+
+    let branch = write_apk(
+        &dir,
+        "branch.apk",
+        &[("classes.dex", support::make_branch_dex().as_slice())],
+        false,
+    );
+    let source = get_class_source(&branch, "example.Test", &opts(2)).unwrap();
+    assert!(source.contains("class Test"), "{source}");
+    assert!(source.contains("choose"), "{source}");
+    assert!(source.contains("if"), "{source}");
+    let manifest = sample_manifest();
+    let dump_apk_path = write_apk(
+        &dir,
+        "branch-dump.apk",
+        &[
+            ("AndroidManifest.xml", manifest.as_slice()),
+            ("classes.dex", support::make_branch_dex().as_slice()),
+        ],
+        false,
+    );
+    let out = dir.join("branch-out");
+    let stats = dump_apk(&dump_apk_path, &out, &opts(2)).unwrap();
+    assert_eq!(stats.classes, 1);
+    assert_eq!(stats.errors, 0);
+    let dumped = std::fs::read_to_string(out.join("example/Test.java")).unwrap();
+    assert!(dumped.contains("if"), "{dumped}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ddc_getclass_rewrites_string_resources() {
+    let dex = support::make_return_string_dex(b"@string/app_name");
+    let dir = std::env::temp_dir().join(format!("asc-ddc-res-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apk = write_apk(
+        &dir,
+        "res.apk",
+        &[
+            ("classes.dex", dex.as_slice()),
+            ("resources.arsc", hello_arsc().as_slice()),
+        ],
+        false,
+    );
+    let source = get_class_source(&apk, "example.Test", &opts(2)).unwrap();
+    assert!(source.contains("Hello"), "{source}");
+    assert!(!source.contains("@string/app_name"), "{source}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn hello_arsc() -> Vec<u8> {
+    fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn utf8_pool(strings: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        for text in strings {
+            offsets.push(body.len() as u32);
+            body.push(text.chars().count() as u8);
+            body.push(text.len() as u8);
+            body.extend_from_slice(text.as_bytes());
+            body.push(0);
+        }
+        let header_size = 28;
+        let strings_start = header_size + strings.len() * 4;
+        let mut pool = vec![0u8; strings_start];
+        put_u16(&mut pool, 0, 0x0001);
+        put_u16(&mut pool, 2, header_size as u16);
+        put_u32(&mut pool, 8, strings.len() as u32);
+        put_u32(&mut pool, 16, 1 << 8);
+        put_u32(&mut pool, 20, strings_start as u32);
+        for (index, offset) in offsets.iter().enumerate() {
+            put_u32(&mut pool, header_size + index * 4, *offset);
+        }
+        pool.extend(body);
+        let len = pool.len() as u32;
+        put_u32(&mut pool, 4, len);
+        pool
+    }
+    let global = utf8_pool(&["Hello"]);
+    let types = utf8_pool(&["string"]);
+    let keys = utf8_pool(&["app_name"]);
+    let config_size = 28u32;
+    let header_size = 20 + config_size as usize;
+    let entries_start = header_size + 4;
+    let mut chunk = vec![0u8; entries_start + 16];
+    put_u16(&mut chunk, 0, 0x0201);
+    put_u16(&mut chunk, 2, header_size as u16);
+    chunk[8] = 1;
+    put_u32(&mut chunk, 12, 1);
+    put_u32(&mut chunk, 16, entries_start as u32);
+    put_u32(&mut chunk, 20, config_size);
+    put_u32(&mut chunk, header_size, 0);
+    put_u16(&mut chunk, entries_start, 8);
+    put_u32(&mut chunk, entries_start + 4, 0);
+    put_u16(&mut chunk, entries_start + 8, 8);
+    chunk[entries_start + 11] = 0x03;
+    put_u32(&mut chunk, entries_start + 12, 0);
+    let chunk_len = chunk.len() as u32;
+    put_u32(&mut chunk, 4, chunk_len);
+
+    let mut package = vec![0u8; 288];
+    put_u16(&mut package, 0, 0x0200);
+    put_u16(&mut package, 2, 288);
+    put_u32(&mut package, 8, 0x7f);
+    let type_off = package.len();
+    package.extend(types);
+    let key_off = package.len();
+    package.extend(keys);
+    put_u32(&mut package, 268, type_off as u32);
+    put_u32(&mut package, 276, key_off as u32);
+    package.extend(chunk);
+    let package_len = package.len() as u32;
+    put_u32(&mut package, 4, package_len);
+
+    let mut table = vec![0u8; 12];
+    put_u16(&mut table, 0, 0x0002);
+    put_u16(&mut table, 2, 12);
+    put_u32(&mut table, 8, 1);
+    table.extend(global);
+    table.extend(package);
+    let table_len = table.len() as u32;
+    put_u32(&mut table, 4, table_len);
+    table
 }
 
 fn sample_manifest() -> Vec<u8> {

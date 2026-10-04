@@ -68,6 +68,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "asc"
 version = "0.1.0"
 dependencies = [
@@ -95,6 +101,8 @@ dependencies = [
  "asc-axml",
  "asc-dex",
  "crc32fast",
+ "ddc-dec",
+ "ddc-dex",
  "flate2",
  "memmap2",
  "thiserror",
@@ -125,6 +133,12 @@ dependencies = [
  "memmap2",
  "thiserror",
 ]
+
+[[package]]
+name = "bitflags"
+version = "2.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "cfg-if"
@@ -188,6 +202,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ddc-dec"
+version = "0.1.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec83c139fae8cffd40c68ec7424f1f446a9cf62ccec79fb6b67d8e61bb3a0cde"
+dependencies = [
+ "anyhow",
+ "ddc-dex",
+ "jdc-core",
+]
+
+[[package]]
+name = "ddc-dex"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fc35963bc603bd97801d073a1cf37ed2fe444825ed4c19356df82ad77593e68"
+
+[[package]]
 name = "flate2"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -208,6 +239,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "jdc-core"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f203aaa3e0e9a47e1b3e8ddfaab12157c84cc8e5037c459c236d26da2e5b10a0"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "libc"

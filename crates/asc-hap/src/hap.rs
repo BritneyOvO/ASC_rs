@@ -307,11 +307,16 @@ fn is_code_abc(name: &str) -> bool {
 }
 
 fn is_hap_marker(name: &str) -> bool {
-    is_code_abc(name) || is_manifest_name(name)
+    // `config.json` is only a manifest fallback after the file is already a
+    // HAP. Android apps ship the same name under assets/, so it cannot mark
+    // the container by itself.
+    is_code_abc(name) || is_hap_identity(name)
 }
 
-fn is_manifest_name(name: &str) -> bool {
-    manifest_rank(name).is_some() || pack_info_rank(name).is_some()
+fn is_hap_identity(name: &str) -> bool {
+    matches!(name, "module.json" | "pack.info")
+        || name.ends_with("/module.json")
+        || name.ends_with("/pack.info")
 }
 
 fn choose_manifest(entries: &[ZipEntry]) -> Option<&ZipEntry> {
@@ -922,6 +927,13 @@ mod tests {
         let path = dir.join("entry.hap");
         std::fs::write(&path, hap).unwrap();
         assert!(is_hap(&path).unwrap());
+        let apk_like = dir.join("config-only.apk");
+        std::fs::write(
+            &apk_like,
+            zip_stored(&[("assets/dva_splits/config.json", br#"{"splits":[]}"#)]),
+        )
+        .unwrap();
+        assert!(!is_hap(&apk_like).unwrap());
         let names = list_classes(&path, Some("Ldemo"), &options()).unwrap();
         assert_eq!(
             names,

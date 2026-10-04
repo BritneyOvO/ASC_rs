@@ -18,14 +18,25 @@ use crate::{Error, Result};
 use asc_axml::manifest_xml as decode_manifest;
 use asc_dex::bytes;
 use asc_dex::{
-    decompile_class, decompile_class_def, find_in_dex_resolved, normalize_dalvik_class,
-    normalize_prefix, Dex, RefQuery,
+    find_in_dex_resolved, normalize_dalvik_class, normalize_prefix, smali_class, smali_class_def,
+    Dex, RefQuery,
 };
+
+/// Which decompiler writes method bodies for `getclass` and `dump`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Engine {
+    /// Structured Java via ddc (`ddc-dec` / `jdc-core`).
+    #[default]
+    Ddc,
+    /// Baksmali text for the one class ASC already found.
+    Smali,
+}
 
 #[derive(Clone, Debug)]
 pub struct Options {
     pub threads: usize,
     pub debug: bool,
+    pub engine: Engine,
 }
 
 impl Default for Options {
@@ -33,6 +44,7 @@ impl Default for Options {
         Self {
             threads: 8,
             debug: false,
+            engine: Engine::Ddc,
         }
     }
 }
@@ -138,9 +150,18 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
     if options.debug {
         eprintln!("[DEBUG] Hit DEX: {dex_name}");
     }
-    let source = resources
-        .rewrite_code(&decompile_class(&dex_buf, &descriptor)?)
-        .into_owned();
+    // One image. Other DEX files stay compressed in the ZIP until a later
+    // query names a class they define.
+    let text = match options.engine {
+        Engine::Smali => smali_class(&dex_buf, &descriptor)?,
+        Engine::Ddc => crate::ddc_engine::decompile_one(dex_buf, &descriptor)?,
+    };
+    // Smali stays assemblable. Resource substitution is for the Java path.
+    let source = if options.engine == Engine::Smali {
+        text
+    } else {
+        resources.rewrite_code(&text).into_owned()
+    };
     if options.debug {
         eprintln!(
             "[DEBUG] Total Execution Time: {:.2} us",
@@ -158,9 +179,13 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     let resources = load_resource_table(&map);
     let xml = manifest_text(&map, &resources)?;
     fs::write(out_dir.join("AndroidManifest.xml"), xml)?;
-    let entries = parse_cd_dex_entries(&map)?;
+    let mut entries = parse_cd_dex_entries(&map)?;
     if entries.is_empty() {
         return Ok(DumpStats::default());
+    }
+    if options.engine == Engine::Ddc {
+        sort_by_load_order(&mut entries);
+        return dump_with_ddc(&map, &entries, out_dir, options, &resources, started);
     }
     let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
@@ -198,7 +223,7 @@ fn dump_dex_entry(
     options: &Options,
     rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
-    resources: &crate::arsc::ResourceTable,
+    _resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
     let mut errors = 0usize;
@@ -226,16 +251,104 @@ fn dump_dex_entry(
                     continue;
                 }
             };
-            match decompile_class_def(&dex, &def) {
+            match smali_class_def(&dex, &def) {
                 Ok(source) => {
-                    let rewritten = resources.rewrite_code(&source);
-                    let dest = class_output_path(out_dir, &class_desc);
-                    publish_class(claims, &dest, rank, rewritten.as_ref())?;
+                    let dest = class_output_path(out_dir, &class_desc, "smali");
+                    publish_class(claims, &dest, rank, &source)?;
                 }
                 Err(err) => {
                     errors += 1;
                     if options.debug {
                         eprintln!("[APK] '{}' {class_desc} decompile error: {err}", entry.name);
+                    }
+                }
+            }
+        }
+    }
+    if options.debug {
+        eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
+    }
+    Ok(errors)
+}
+
+fn dump_with_ddc(
+    apk: &[u8],
+    entries: &[DexEntry],
+    out_dir: &Path,
+    options: &Options,
+    resources: &crate::arsc::ResourceTable,
+    started: Instant,
+) -> Result<DumpStats> {
+    let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
+    let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
+    let errors = run_indexed(entries.len(), options.threads, |index| {
+        dump_dex_entry_ddc(
+            apk,
+            &entries[index],
+            out_dir,
+            options,
+            ranks[index],
+            &claims,
+            resources,
+        )
+    })?;
+    let total = DumpStats {
+        classes: claims.lock().expect("mutex poisoned").len(),
+        errors: errors.into_iter().sum(),
+    };
+    if options.debug {
+        eprintln!(
+            "[APK] dump ddc total={:.2} us classes={} errors={} workers={}",
+            started.elapsed().as_secs_f64() * 1_000_000.0,
+            total.classes,
+            total.errors,
+            options.threads.min(entries.len())
+        );
+    }
+    Ok(total)
+}
+
+fn dump_dex_entry_ddc(
+    apk: &[u8],
+    entry: &DexEntry,
+    out_dir: &Path,
+    options: &Options,
+    rank_base: (u8, u8, u32, u32),
+    claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    resources: &crate::arsc::ResourceTable,
+) -> Result<usize> {
+    let data = inflate_dex(apk, entry)?;
+    let mut errors = 0usize;
+    for (logical, (_name, buf)) in logical_buffers(&entry.name, data)?.into_iter().enumerate() {
+        let rank = ClassRank {
+            module: rank_base.0,
+            kind: rank_base.1,
+            ordinal: rank_base.2,
+            tie: rank_base.3,
+            logical: logical as u32,
+        };
+        let image = crate::ddc_engine::Image::open(buf)?;
+        for internal in image.top_level() {
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                image.render(&internal)
+            }));
+            match rendered {
+                Ok(Ok(source)) => {
+                    let rewritten = resources.rewrite_code(&source);
+                    let descriptor = crate::ddc_engine::internal_to_descriptor(&internal);
+                    let dest = class_output_path(out_dir, &descriptor, "java");
+                    publish_class(claims, &dest, rank, rewritten.as_ref())?;
+                }
+                Ok(Err(err)) => {
+                    errors += 1;
+                    if options.debug {
+                        eprintln!("[APK] '{}' {internal} decompile error: {err}", entry.name);
+                    }
+                }
+                Err(_) => {
+                    errors += 1;
+                    if options.debug {
+                        eprintln!("[APK] '{}' {internal} decompile panicked", entry.name);
                     }
                 }
             }
@@ -327,7 +440,7 @@ fn sort_by_load_order(entries: &mut [DexEntry]) {
     });
 }
 
-fn class_output_path(out_dir: &Path, descriptor: &str) -> PathBuf {
+fn class_output_path(out_dir: &Path, descriptor: &str, extension: &str) -> PathBuf {
     let trimmed = descriptor
         .strip_prefix('L')
         .unwrap_or(descriptor)
@@ -351,7 +464,7 @@ fn class_output_path(out_dir: &Path, descriptor: &str) -> PathBuf {
             safe
         };
         if index + 1 == parts.len() {
-            dest.push(format!("{name}.java"));
+            dest.push(format!("{name}.{extension}"));
         } else {
             dest.push(name);
         }

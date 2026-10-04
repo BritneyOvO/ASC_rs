@@ -6,3 +6,8 @@ https://github.com/MG1937/ASC
 
 The original work and this derivative are licensed under the Apache License,
 Version 2.0. See the LICENSE file.
+
+Default DEX decompilation uses ddc and jdc-core by ejfkdev, both under the
+MIT license:
+https://github.com/ejfkdev/ddc
+https://github.com/ejfkdev/jdc-core

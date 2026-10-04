@@ -9,6 +9,7 @@ ASC 的 Rust 重写。它是给自动化分析和移动安全研究用的 Androi
 ```text
 asc getclass app.apk Lcom/poc/Main; -o Main.java
 asc getclass app.apk com.poc.Main --threads 16
+asc getclass app.apk com.poc.Main --engine smali
 asc listclass app.apk --prefix com.poc -o classes.txt
 asc getmanifest app.apk -o AndroidManifest.xml
 asc findrefs app.apk string token -o string_refs.txt
@@ -17,6 +18,8 @@ asc findrefs app.apk method onCreate --class com.poc.Main
 asc findrefs app.apk method notify --class MainActivity --fuzzy-class
 asc findrefs app.apk field apiKey
 ```
+
+`getclass` 和 `dump` 默认用 [ddc](https://github.com/ejfkdev/ddc) 把方法体收成带控制流的 Java。`--engine smali` 输出 baksmali 文本，指令名和寄存器都保留。`listclass`、`findrefs`、清单，以及 HAP / ABC，不走 ddc。
 
 `listclass` 按 DEX 条目和 `class_def` 的顺序输出 Dalvik 描述符，一行一个。`--prefix com.poc` 会规范成 `Lcom/poc`。`findrefs` 的 string/type 在每条字符串内容上做正则搜索（`.` 匹配任意字节，可以命中字符串中间）。不带 `--class` 的 method/field 名字必须匹配整个简单名；带精确 `--class` 时名字按字面量完全相等。`--fuzzy-class` 的类名仍是子串正则。
 
@@ -37,7 +40,7 @@ cargo build --release
 ## 和上游 Python 版的差别
 
 - 引用搜索、类列表、DEX 041 容器和 ZIP 中央目录扫描沿用同一套规则：16 字节指令桶、指令边界校验、按需 inflate。
-- `getclass` 用原生字节码提升打印 Java 签名和方法体，不调用 Androguard。类结构、方法签名和常量可以直接读；控制流不会被重构成完整的 Java AST。
+- `getclass` 和 `dump` 默认调用 ddc（`jdc-core`）重构控制流。`--engine smali` 打印标准 smali，不把指令提升成 Java 语句。
 - `findrefs` 同时命中多个 DEX 时，结果按压缩后体积排序，避免多线程完成顺序抖动。
 
 ## 许可

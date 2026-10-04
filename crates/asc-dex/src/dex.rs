@@ -96,7 +96,6 @@ pub struct Proto {
 pub struct CodeItem<'a> {
     pub registers_size: u16,
     pub ins_size: u16,
-    pub outs_size: u16,
     pub insns: &'a [u8],
 }
 
@@ -320,7 +319,6 @@ impl<'a> Dex<'a> {
         let at = off as usize;
         let registers_size = u16_at(self.data, at)?;
         let ins_size = u16_at(self.data, at + 2)?;
-        let outs_size = u16_at(self.data, at + 4)?;
         let insns_size = u32_at(self.data, at + 12)? as usize;
         let start = at + 16;
         let end = start + insns_size * 2;
@@ -331,7 +329,6 @@ impl<'a> Dex<'a> {
         Ok(CodeItem {
             registers_size,
             ins_size,
-            outs_size,
             insns,
         })
     }
@@ -644,9 +641,9 @@ pub fn java_type(desc: &str) -> String {
         "J" => "long".to_string(),
         "F" => "float".to_string(),
         "D" => "double".to_string(),
-        other if other.starts_with('L') && other.ends_with(';') => other[1..other.len() - 1]
-            .replace('/', ".")
-            .replace('$', "."),
+        other if other.starts_with('L') && other.ends_with(';') => {
+            other[1..other.len() - 1].replace(['/', '$'], ".")
+        }
         other => other.to_string(),
     };
     format!("{base}{}", "[]".repeat(dims))

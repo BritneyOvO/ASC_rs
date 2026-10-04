@@ -1,4 +1,4 @@
-//! DEX parser, instruction lifter, and reference search.
+//! DEX parser, smali printer, and reference search.
 //!
 //! The input is a DEX byte slice. ZIP containers and manifests live in other crates.
 
@@ -6,12 +6,12 @@
 mod error;
 
 pub mod bytes;
-mod decompile;
 pub mod dex;
 pub mod findrefs;
 mod opcodes;
+mod smali;
 
-pub use decompile::{decompile_class, decompile_class_def};
+pub use smali::{smali_class, smali_class_def};
 pub use dex::{normalize_dalvik_class, normalize_prefix, Dex};
 pub use error::{Error, Result};
 pub use findrefs::{find_in_dex, find_in_dex_resolved, MemberSel, RefQuery};

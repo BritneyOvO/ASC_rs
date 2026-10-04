@@ -6,8 +6,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use asc_abc::{class_names, class_text, find_members, find_strings, find_types, is_abc};
 use asc_apk::{
-    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Error, MemberSel, Options,
-    RefQuery, Result,
+    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Engine, Error, MemberSel,
+    Options, RefQuery, Result,
 };
 use asc_hap::{self, Query};
 
@@ -20,6 +20,7 @@ use asc_hap::{self, Query};
 examples:
   asc getclass app.apk Lcom/poc/Main; -o Main.java
   asc getclass app.apk com.poc.Main --threads 16
+  asc getclass app.apk com.poc.Main --engine smali
   asc listclass app.apk -o classes.txt
   asc listclass app.apk --prefix com.poc
   asc getmanifest app.apk -o AndroidManifest.xml
@@ -35,6 +36,29 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum EngineArg {
+    /// Structured Java via ddc.
+    Ddc,
+    /// Baksmali text.
+    Smali,
+}
+
+fn engine_of(arg: EngineArg) -> Engine {
+    match arg {
+        EngineArg::Ddc => Engine::Ddc,
+        EngineArg::Smali => Engine::Smali,
+    }
+}
+
+fn apk_options(threads: usize, debug: bool, engine: Engine) -> Options {
+    Options {
+        threads,
+        debug,
+        engine,
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Locate the target class in an APK and decompile it.
@@ -43,6 +67,9 @@ enum Commands {
         debug: bool,
         #[arg(long, alias = "thread", default_value_t = 8)]
         threads: usize,
+        /// `ddc` writes Java. `smali` writes baksmali text.
+        #[arg(long, value_enum, default_value = "ddc")]
+        engine: EngineArg,
         #[arg(short, long)]
         output: Option<PathBuf>,
         apk_path: PathBuf,
@@ -75,6 +102,9 @@ enum Commands {
         debug: bool,
         #[arg(long, alias = "thread", default_value_t = 8)]
         threads: usize,
+        /// Decompiler for method bodies. Defaults to ddc.
+        #[arg(long, value_enum, default_value = "ddc")]
+        engine: EngineArg,
         #[arg(short, long)]
         output: PathBuf,
         apk_path: PathBuf,
@@ -157,6 +187,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Getclass {
             debug,
             threads,
+            engine,
             output,
             apk_path,
             dalvik_class,
@@ -167,7 +198,11 @@ fn execute(cli: Cli) -> Result<()> {
                 asc_hap::get_class_source(&apk_path, &dalvik_class, &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
-                get_class_source(&apk_path, &dalvik_class, &Options { threads, debug })?
+                get_class_source(
+                    &apk_path,
+                    &dalvik_class,
+                    &apk_options(threads, debug, engine_of(engine)),
+                )?
             };
             emit(&source, output.as_deref(), true)?;
         }
@@ -184,7 +219,11 @@ fn execute(cli: Cli) -> Result<()> {
                 asc_hap::list_classes(&apk_path, prefix.as_deref(), &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
-                list_classes(&apk_path, prefix.as_deref(), &Options { threads, debug })?
+                list_classes(
+                    &apk_path,
+                    prefix.as_deref(),
+                    &apk_options(threads, debug, Engine::Ddc),
+                )?
             };
             let text = if names.is_empty() {
                 String::new()
@@ -224,6 +263,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Dump {
             debug,
             threads,
+            engine,
             output,
             apk_path,
         } => {
@@ -242,7 +282,11 @@ fn execute(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             let started = std::time::Instant::now();
-            let stats = dump_apk(&apk_path, &output, &Options { threads, debug })?;
+            let stats = dump_apk(
+                &apk_path,
+                &output,
+                &apk_options(threads, debug, engine_of(engine)),
+            )?;
             eprintln!(
                 "dumped {} classes ({} errors) -> {}",
                 stats.classes,
@@ -298,7 +342,11 @@ fn execute(cli: Cli) -> Result<()> {
                 asc_hap::find_refs(&apk_path, hap_query(&query), &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
-                find_refs(&apk_path, &query, &Options { threads, debug })?
+                find_refs(
+                    &apk_path,
+                    &query,
+                    &apk_options(threads, debug, Engine::Ddc),
+                )?
             };
             let text = if lines.is_empty() {
                 String::new()

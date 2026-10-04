@@ -9,6 +9,8 @@ description = "APK and Android App Bundle access for ASC"
 [dependencies]
 asc-axml.workspace = true
 asc-dex.workspace = true
+ddc-dec.workspace = true
+ddc-dex.workspace = true
 crc32fast.workspace = true
 flate2.workspace = true
 memmap2.workspace = true
