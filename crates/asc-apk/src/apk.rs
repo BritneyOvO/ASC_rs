@@ -189,6 +189,7 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     }
     let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
+    let dirs = Mutex::new(HashSet::<PathBuf>::new());
     let errors = run_indexed(entries.len(), options.threads, |index| {
         dump_dex_entry(
             &map,
@@ -197,6 +198,7 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
             options,
             ranks[index],
             &claims,
+            &dirs,
             &resources,
         )
     })?;
@@ -223,6 +225,7 @@ fn dump_dex_entry(
     options: &Options,
     rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    dirs: &Mutex<HashSet<PathBuf>>,
     _resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
@@ -254,7 +257,7 @@ fn dump_dex_entry(
             match smali_class_def(&dex, &def) {
                 Ok(source) => {
                     let dest = class_output_path(out_dir, &class_desc, "smali");
-                    publish_class(claims, &dest, rank, &source)?;
+                    publish_class(claims, dirs, &dest, rank, &source, false)?;
                 }
                 Err(err) => {
                     errors += 1;
@@ -281,20 +284,26 @@ fn dump_with_ddc(
 ) -> Result<DumpStats> {
     let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
-    let errors = run_indexed(entries.len(), options.threads, |index| {
-        dump_dex_entry_ddc(
+    let dirs = Mutex::new(HashSet::<PathBuf>::new());
+    // One DEX image at a time. The thread budget decompiles classes inside
+    // that image, so a large classesN.dex does not run single-threaded
+    // while the other workers sit idle.
+    let mut errors = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        errors += dump_dex_entry_ddc(
             apk,
-            &entries[index],
+            entry,
             out_dir,
             options,
             ranks[index],
             &claims,
+            &dirs,
             resources,
-        )
-    })?;
+        )?;
+    }
     let total = DumpStats {
         classes: claims.lock().expect("mutex poisoned").len(),
-        errors: errors.into_iter().sum(),
+        errors,
     };
     if options.debug {
         eprintln!(
@@ -315,6 +324,7 @@ fn dump_dex_entry_ddc(
     options: &Options,
     rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    dirs: &Mutex<HashSet<PathBuf>>,
     resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
@@ -328,31 +338,38 @@ fn dump_dex_entry_ddc(
             logical: logical as u32,
         };
         let image = crate::ddc_engine::Image::open(buf)?;
-        for internal in image.top_level() {
+        let names = image.top_level();
+        let class_errors = AtomicUsize::new(0);
+        run_indexed(names.len(), options.threads, |index| {
+            let internal = &names[index];
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                image.render(&internal)
+                image.render(internal)
             }));
             match rendered {
                 Ok(Ok(source)) => {
                     let rewritten = resources.rewrite_code(&source);
-                    let descriptor = crate::ddc_engine::internal_to_descriptor(&internal);
+                    let descriptor = crate::ddc_engine::internal_to_descriptor(internal);
                     let dest = class_output_path(out_dir, &descriptor, "java");
-                    publish_class(claims, &dest, rank, rewritten.as_ref())?;
+                    publish_class(claims, dirs, &dest, rank, rewritten.as_ref(), true)?;
+                    Ok(())
                 }
                 Ok(Err(err)) => {
-                    errors += 1;
+                    class_errors.fetch_add(1, Ordering::Relaxed);
                     if options.debug {
                         eprintln!("[APK] '{}' {internal} decompile error: {err}", entry.name);
                     }
+                    Ok(())
                 }
                 Err(_) => {
-                    errors += 1;
+                    class_errors.fetch_add(1, Ordering::Relaxed);
                     if options.debug {
                         eprintln!("[APK] '{}' {internal} decompile panicked", entry.name);
                     }
+                    Ok(())
                 }
             }
-        }
+        })?;
+        errors += class_errors.load(Ordering::Relaxed);
     }
     if options.debug {
         eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
@@ -362,20 +379,37 @@ fn dump_dex_entry_ddc(
 
 fn publish_class(
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
+    dirs: &Mutex<HashSet<PathBuf>>,
     dest: &Path,
     rank: ClassRank,
     source: &str,
+    direct: bool,
 ) -> Result<()> {
     if claims
         .lock()
-        .unwrap()
+        .expect("mutex poisoned")
         .get(dest)
         .is_some_and(|prev| *prev < rank)
     {
         return Ok(());
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        let mut known = dirs.lock().expect("mutex poisoned");
+        if !known.contains(parent) {
+            fs::create_dir_all(parent)?;
+            known.insert(parent.to_path_buf());
+        }
+    }
+    // DEX images are written in load order, so a direct write cannot lose
+    // to a better rank still in flight. Parallel images still stage a temp
+    // file and rename it under the claim lock.
+    if direct {
+        fs::write(dest, source)?;
+        claims
+            .lock()
+            .expect("mutex poisoned")
+            .insert(dest.to_path_buf(), rank);
+        return Ok(());
     }
     let file_name = dest
         .file_name()
