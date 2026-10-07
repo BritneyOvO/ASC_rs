@@ -163,8 +163,52 @@ fn format_matched(
     }
 }
 
+/// Whether a string pool entry carries a resource token.
+///
+/// `@` always marks one. `?` only does when it opens a real reference
+/// (`?attr/name`, `?0x7f010000`); a bare `?` is ordinary text — a URL query, a
+/// question mark, a stored regex — and paying for a `resolve` call on every
+/// such match is wasted work.
 fn has_at_ref(bytes: &[u8]) -> bool {
-    bytes.iter().any(|byte| *byte == b'@' || *byte == b'?')
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'@' => return true,
+            b'?' => {
+                if opens_resource_ref(bytes, index + 1) {
+                    return true;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+/// What may follow `@` or `?`: `0x...`, or `type/name` and `type:name/entry`.
+fn opens_resource_ref(bytes: &[u8], mut at: usize) -> bool {
+    if bytes.get(at) == Some(&b'+') {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'0') && matches!(bytes.get(at + 1), Some(b'x' | b'X')) {
+        return bytes
+            .get(at + 2)
+            .is_some_and(|byte| byte.is_ascii_hexdigit());
+    }
+    let Some(&first) = bytes.get(at) else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    while bytes
+        .get(at)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        at += 1;
+    }
+    matches!(bytes.get(at), Some(b'/' | b':'))
 }
 
 fn byte_regex(pattern: &str) -> Result<regex::bytes::Regex> {
@@ -602,6 +646,30 @@ fn scan_group(
         };
         if idxs.contains(&idx) {
             hits.push((pos, idx));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_at_ref;
+
+    #[test]
+    fn only_real_resource_tokens_look_like_references() {
+        for token in [
+            "@string/app_name",
+            "@0x7f010000",
+            "?attr/colorPrimary",
+            "?0x7f010000",
+            "prefix @mipmap/icon suffix",
+            // `@` is always a marker, even where nothing follows it.
+            "@",
+            "a@b",
+        ] {
+            assert!(has_at_ref(token.as_bytes()), "{token}");
+        }
+        for plain in ["colou?r", "https://example.com/a?b=c", "what?", "?", "?nope"] {
+            assert!(!has_at_ref(plain.as_bytes()), "{plain}");
         }
     }
 }

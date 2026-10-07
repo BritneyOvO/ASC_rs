@@ -474,6 +474,31 @@ enum TagKind {
     Method,
 }
 
+/// Literal array payload widths, from `LiteralTag` in `libpandafile`.
+///
+/// Tags match the enum in `literal_data_accessor.h` one for one. `TAGVALUE`
+/// (0x00) is `INTEGER_8`: an eight bit integer, *not* a string. `EnumerateLiteralVals`
+/// has no case for it at all (it falls through to `UNREACHABLE`), and the
+/// disassembler drops it rather than reading a string, so it is skipped here
+/// too.
+fn literal_tag_width(tag: u8) -> Option<usize> {
+    match tag {
+        // INTEGER_8 (TAGVALUE)
+        0x00 => Some(1),
+        // BOOL, ACCESSOR, BUILTINTYPEINDEX, NULLVALUE
+        0x01 | 0x08 | 0x19 | 0xff => Some(1),
+        // METHODAFFILIATE
+        0x09 => Some(2),
+        // INTEGER, FLOAT, LITERALBUFFERINDEX, and every pointer-valued tag:
+        // STRING, METHOD, GENERATORMETHOD, ASYNCGENERATORMETHOD, LITERALARRAY,
+        // GETTER, SETTER, ETS_IMPLEMENTS.
+        0x02 | 0x03 | 0x05 | 0x06 | 0x07 | 0x16 | 0x17 | 0x18 | 0x1a | 0x1b | 0x1c => Some(4),
+        // DOUBLE
+        0x04 => Some(8),
+        _ => None,
+    }
+}
+
 fn literal_strings(data: &[u8], off: usize) -> Result<Vec<Name<'_>>> {
     let count = u32_at(data, off)? as usize;
     let mut pos = off + 4;
@@ -484,47 +509,61 @@ fn literal_strings(data: &[u8], off: usize) -> Result<Vec<Name<'_>>> {
             .get(pos)
             .ok_or_else(|| crate::Error::new("truncated ABC literal"))?;
         pos += 1;
-        match tag {
-            0x02 | 0x03 | 0x17 => pos += 4,
-            0x04 => pos += 8,
-            0x01 | 0x08 | 0x19 | 0xff => pos += 1,
-            0x09 => pos += 2,
-            0x05 | 0x06 | 0x07 | 0x16 | 0x18 | 0x1a | 0x1b | 0x1c => {
+        // ARRAY_STRING holds a count followed by that many string pointers.
+        if tag == 0x15 {
+            let n = u32_at(data, pos)? as usize;
+            pos += 4;
+            for _ in 0..n {
                 let str_off = u32_at(data, pos)? as usize;
                 pos += 4;
-                if tag == 0x05 {
-                    let (tagged, len) = read_uleb_at(data, str_off)?;
-                    let start = str_off + len;
-                    let bytes = read_until_nul(data, start)?;
-                    out.push(Name {
-                        utf16_len: tagged >> 1,
-                        bytes,
-                        encoded_len: 0,
-                    });
-                }
+                out.push(read_literal_string(data, str_off)?);
             }
-            0x15 => {
-                let n = u32_at(data, pos)? as usize;
-                pos += 4;
-                for _ in 0..n {
-                    let str_off = u32_at(data, pos)? as usize;
-                    pos += 4;
-                    let (tagged, len) = read_uleb_at(data, str_off)?;
-                    let start = str_off + len;
-                    let bytes = read_until_nul(data, start)?;
-                    out.push(Name {
-                        utf16_len: tagged >> 1,
-                        bytes,
-                        encoded_len: 0,
-                    });
-                }
-                break;
+            break;
+        }
+        // Every other typed array is a single pointer to a buffer that carries
+        // its own length, and it always ends the literal array.
+        if (0x0a..=0x14).contains(&tag) {
+            let _ = u32_at(data, pos)?;
+            break;
+        }
+        let Some(width) = literal_tag_width(tag) else {
+            // An unrecognized tag means the payload cannot be walked any
+            // further. Stop here and keep what was already decoded instead of
+            // failing the whole array.
+            break;
+        };
+        if width == 4 {
+            let pointer = u32_at(data, pos)? as usize;
+            pos += 4;
+            // Only STRING holds a string pointer here. The pointer-valued
+            // neighbours (METHOD, GETTER, SETTER, ...) do not address string
+            // data, so they must not be decoded as one.
+            if tag == 0x05 {
+                out.push(read_literal_string(data, pointer)?);
             }
-            _ => break,
+        } else {
+            pos += width;
         }
         index += 2;
     }
     Ok(out)
+}
+
+/// Reads a string the pointer is expected to address. The decoder is strict on
+/// purpose: a mistyped pointer usually reads a length that runs past the end of
+/// the file, and that error is what tells the caller this was not a string.
+fn read_literal_string(data: &[u8], str_off: usize) -> Result<Name<'_>> {
+    let (tagged, len) = read_uleb_at(data, str_off)?;
+    if tagged & 1 == 0 {
+        bail!("ABC string at {str_off:#x} is not tagged as a string");
+    }
+    let start = str_off + len;
+    let bytes = read_until_nul(data, start)?;
+    Ok(Name {
+        utf16_len: tagged >> 1,
+        bytes,
+        encoded_len: 0,
+    })
 }
 
 fn skip_tags(data: &[u8], mut pos: usize, kind: TagKind) -> Result<usize> {
@@ -897,5 +936,173 @@ mod tests {
         );
         let methods = find_members(&data, "app.abc", true, "main", Some("Ldemo/App;")).unwrap();
         assert_eq!(methods, vec!["app.abc | Ldemo/App;->main".to_string()]);
+    }
+
+    /// One entry of a hand-built literal array.
+    enum Lit {
+        /// A string with tag 0x05.
+        Str,
+        /// A non-string entry carrying its tag byte and an inline value.
+        Tag(u8),
+        /// ARRAY_STRING: a count followed by that many string pointers.
+        ArrayString(usize),
+    }
+
+    /// Builds an ABC whose single literal array holds `items`, returning the
+    /// file, the strings a decode should find, and the array's file offset.
+    fn abc_with_literal(items: &[Lit]) -> (Vec<u8>, Vec<String>, usize) {
+        let mut buf = vec![0u8; 60];
+        buf[..8].copy_from_slice(b"PANDA\0\0\0");
+        buf[12] = 2;
+        let mut expected = Vec::new();
+        let mut offsets = Vec::new();
+        let mut index = 0;
+        for item in items {
+            let count = match item {
+                Lit::ArrayString(n) => *n,
+                _ => 1,
+            };
+            for _ in 0..count {
+                if matches!(item, Lit::Str | Lit::ArrayString(_)) {
+                    let text = format!("lit{index}");
+                    index += 1;
+                    offsets.push(buf.len() as u32);
+                    buf.extend(panda_str(&text));
+                    expected.push(text);
+                }
+            }
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(items.len() as u32 * 2).to_le_bytes());
+        let mut next = 0;
+        for item in items {
+            let (tag, count) = match item {
+                Lit::Str => (0x05, 1),
+                Lit::Tag(tag) => (*tag, 0),
+                Lit::ArrayString(n) => (0x15, *n),
+            };
+            payload.push(tag);
+            if tag == 0x15 {
+                payload.extend_from_slice(&(count as u32).to_le_bytes());
+            }
+            for _ in 0..count {
+                payload.extend_from_slice(&offsets[next].to_le_bytes());
+                next += 1;
+            }
+            // Only scalar entries carry an inline payload; the pointer tags
+            // (STRING, ARRAY_STRING) are already complete. The widths are
+            // spelled out independently of `literal_tag_width`, so a change to
+            // one has to be made in both places or these tests go red.
+            if matches!(item, Lit::Tag(_)) {
+                match tag {
+                    // DOUBLE
+                    0x04 => payload.extend_from_slice(&0u64.to_le_bytes()),
+                    // METHODAFFILIATE
+                    0x09 => payload.extend_from_slice(&0u16.to_le_bytes()),
+                    // INTEGER_8/TAGVALUE, BOOL, ACCESSOR, BUILTINTYPEINDEX, NULLVALUE
+                    0x00 | 0x01 | 0x08 | 0x19 | 0xff => payload.push(0),
+                    // Every 32 bit value and pointer.
+                    _ => payload.extend_from_slice(&0u32.to_le_bytes()),
+                }
+            }
+        }
+        let array_off = buf.len() as u32;
+        buf.extend_from_slice(&payload);
+        let literal_idx_off = buf.len() as u32;
+        buf.extend_from_slice(&array_off.to_le_bytes());
+        let file_size = buf.len() as u32;
+        put_u32(&mut buf, 16, file_size);
+        put_u32(&mut buf, 44, 1);
+        put_u32(&mut buf, 48, literal_idx_off);
+        put_u32(&mut buf, 52, 1);
+        put_u32(&mut buf, 56, 0);
+        (buf, expected, array_off as usize)
+    }
+
+    fn found_literals(data: &[u8]) -> Vec<String> {
+        super::find_strings(data, "app.abc", "lit").unwrap()
+    }
+
+    #[test]
+    fn literal_arrays_keep_every_string_the_tags_allow() {
+        // A string, then a double and a bool, then another string: the walk
+        // must not stop at the non-string tags.
+        let (data, expected, _) = abc_with_literal(&[
+            Lit::Str,
+            Lit::Tag(0x04),
+            Lit::Tag(0x01),
+            Lit::Str,
+        ]);
+        let found = found_literals(&data);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for text in &expected {
+            assert!(found.iter().any(|line| line.contains(text)), "{text} {found:?}");
+        }
+    }
+
+    #[test]
+    fn tagvalue_is_an_int8_and_never_yields_a_string() {
+        // TAGVALUE (0x00) aliases INTEGER_8. `EnumerateLiteralVals` has no case
+        // for it and the disassembler drops it, so it is a one byte value, not
+        // a string pointer. The array still walks past it to later entries.
+        let (data, expected, _) = abc_with_literal(&[Lit::Tag(0x00), Lit::Str]);
+        let found = found_literals(&data);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(&expected[0]), "{found:?}");
+    }
+
+    #[test]
+    fn pointer_valued_neighbours_are_not_decoded_as_strings() {
+        // METHOD, GETTER and SETTER carry a pointer too, but not to string
+        // data, so they are skipped rather than decoded as one.
+        for tag in [0x06u8, 0x1a, 0x1b] {
+            let (mut data, _, array) = abc_with_literal(&[Lit::Tag(tag)]);
+            // Even a pointer that would read happily as a string is ignored.
+            let pointer_at = array + 4 + 1;
+            data[pointer_at..pointer_at + 4].copy_from_slice(&60u32.to_le_bytes());
+            let found = found_literals(&data);
+            assert!(found.is_empty(), "{tag:#x}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_string_entry_with_a_broken_pointer_is_an_error() {
+        // A STRING entry must address a string; a pointer to something else is
+        // reported instead of being trusted.
+        let (mut data, _, array) = abc_with_literal(&[Lit::Str]);
+        let pointer_at = array + 4 + 1;
+        data[pointer_at..pointer_at + 4].copy_from_slice(&0u32.to_le_bytes());
+        let err = super::find_strings(&data, "app.abc", "lit").unwrap_err();
+        assert!(
+            err.to_string().contains("not tagged as a string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn array_string_keeps_every_element() {
+        let (data, expected, _) = abc_with_literal(&[Lit::ArrayString(3)]);
+        let found = found_literals(&data);
+        assert_eq!(found.len(), 3, "{found:?}");
+        for text in &expected {
+            assert!(found.iter().any(|line| line.contains(text)), "{text} {found:?}");
+        }
+    }
+
+    #[test]
+    fn typed_arrays_end_the_walk_without_losing_earlier_strings() {
+        // A non-string typed array ends the array; the string before it stays.
+        let (data, expected, _) = abc_with_literal(&[Lit::Str, Lit::Tag(0x0a)]);
+        let found = found_literals(&data);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(&expected[0]), "{found:?}");
+    }
+
+    #[test]
+    fn an_unknown_tag_stops_the_walk_without_dropping_earlier_strings() {
+        let (data, expected, _) = abc_with_literal(&[Lit::Str, Lit::Tag(0x20)]);
+        let found = found_literals(&data);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains(&expected[0]), "{found:?}");
     }
 }

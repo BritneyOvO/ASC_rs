@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -233,8 +233,7 @@ fn execute(cli: Cli) -> Result<()> {
             if let Some(path) = output {
                 fs::write(path, text)?;
             } else {
-                print!("{text}");
-                io::stdout().flush()?;
+                write_stdout(&text)?;
             }
         }
         Commands::Getmanifest {
@@ -440,10 +439,21 @@ fn emit(text: &str, output: Option<&std::path::Path>, ensure_newline: bool) -> R
     } else {
         text
     };
-    print!("{text}");
-    io::stdout().flush()?;
+    // The file is written before the stream, so a closed pipe cannot swallow
+    // `-o`, and `-o` silences the stream instead of duplicating it.
     if let Some(path) = output {
         fs::write(path, text)?;
+    } else {
+        write_stdout(text)?;
     }
     Ok(())
+}
+
+fn write_stdout(text: &str) -> Result<()> {
+    match std::io::stdout().write_all(text.as_bytes()) {
+        // The reader walked away: `asc ... | head` is a normal way to stop.
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err.into()),
+        Ok(()) => Ok(()),
+    }
 }

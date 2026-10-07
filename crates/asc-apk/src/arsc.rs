@@ -671,6 +671,11 @@ fn parse_code_number(chars: &[char], index: usize) -> Option<(usize, u32)> {
         if cursor == digits {
             return None;
         }
+        // A Java suffix belongs to the literal: `0x7f010000L` is a long, not a
+        // resource id followed by `L`.
+        if ends_with_java_suffix(chars, cursor) {
+            return None;
+        }
         let text: String = chars[digits..cursor].iter().collect();
         return u32::from_str_radix(&text, 16)
             .ok()
@@ -682,11 +687,22 @@ fn parse_code_number(chars: &[char], index: usize) -> Option<(usize, u32)> {
     while chars.get(cursor).is_some_and(|ch| ch.is_ascii_digit()) {
         cursor += 1;
     }
-    if cursor - index > 10 {
+    if cursor - index > 10 || ends_with_java_suffix(chars, cursor) {
         return None;
     }
     let text: String = chars[index..cursor].iter().collect();
     text.parse::<u32>().ok().map(|id| (cursor - index, id))
+}
+
+/// Whether the char after a run of digits is a Java literal suffix, or a `.`
+/// that would turn the number into a floating point literal.
+fn ends_with_java_suffix(chars: &[char], cursor: usize) -> bool {
+    match chars.get(cursor) {
+        Some('l' | 'L' | 'f' | 'F' | 'd' | 'D' | '.') => true,
+        // An identifier char turns the digits into a larger token.
+        Some(ch) => ch.is_ascii_alphanumeric() || *ch == '_',
+        None => false,
+    }
 }
 
 fn drop_chars(out: &mut String, count: usize) {
@@ -854,6 +870,16 @@ mod tests {
         assert_eq!(table.rewrite_code("v0 = 1;\n"), "v0 = 1;\n");
         let hex = table.rewrite_code("v0 = 0x7f010000;");
         assert!(hex.contains("\"Hello\""), "{hex}");
+        // A Java literal suffix is part of the number, not a following `L`.
+        for untouched in [
+            "v0 = 2130771968L;\n",
+            "v0 = 0x7f010000L;\n",
+            "v0 = 2130771968f;\n",
+            "v0 = 0x7f010000.toLong();\n",
+            "v0 = 2130771968_0;\n",
+        ] {
+            assert_eq!(table.rewrite_code(untouched), untouched, "{untouched}");
+        }
         let empty = ResourceTable::default();
         let untouched = "v0 = 2130771968;\n    sget v1, Lcom/example/R$string;->app_name\n";
         assert_eq!(empty.rewrite_code(untouched), untouched);
