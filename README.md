@@ -21,7 +21,11 @@ asc findrefs app.apk field apiKey
 
 `getclass` 和 `dump` 默认用 [ddc](https://github.com/ejfkdev/ddc) 把方法体收成带控制流的 Java。`--engine smali` 输出 baksmali 文本，指令名和寄存器都保留。`listclass`、`findrefs`、清单，以及 HAP / ABC，不走 ddc。
 
-`listclass` 按 DEX 条目和 `class_def` 的顺序输出 Dalvik 描述符，一行一个。`--prefix com.poc` 会规范成 `Lcom/poc`。`findrefs` 的 string/type 在每条字符串内容上做正则搜索（`.` 匹配任意字节，可以命中字符串中间）。不带 `--class` 的 method/field 名字必须匹配整个简单名；带精确 `--class` 时名字按字面量完全相等。`--fuzzy-class` 的类名仍是子串正则。
+`listclass` 按 DEX 条目和 `class_def` 的顺序输出 Dalvik 描述符，一行一个。`--prefix com.poc` 会规范成 `Lcom/poc`；ABC 侧四种写法（`com.poc`、`Lcom.poc`、`com/poc`、`Lcom/poc`）等价，点号和斜杠都当包分隔符。`findrefs` 的 string/type 在每条字符串内容上做正则搜索（`.` 匹配任意字节，可以命中字符串中间）。不带 `--class` 的 method/field 名字必须匹配整个简单名；带精确 `--class` 时名字按字面量完全相等。`--fuzzy-class` 的类名是子串，但按字面量匹配（内部类的 `$` 不再是正则元字符），只把点号当包分隔符。
+
+资源取值按配置挑选：真正的默认配置（mcc/mnc、locale、密度、uiMode、sdkVersion 等全部限定符都为空）优先于任何限定配置，无论它出现在文件里的先后。字符串资源一律按字符串引用写回代码，即使内容看起来像数字或颜色。
+
+中央目录里任何一条记录读不通都按错误上报，不再静默截断条目列表；`find_eocd` 会核对注释长度，压缩包注释里出现 `PK\x05\x06` 不会被误判。单个条目解压上限为 1 GiB，并且不会超过中央目录声明的解压大小；声明为 0 时按 deflate 的 1032 倍膨胀率上界收紧。HAP 的 `dump` 逐成员容错：读不通的 `.abc` 会告警并计入 `errors`，其余成员照常导出。
 
 `PANDA` 开头的 `.abc` 按方舟文件头现查类名、成员和字面量字符串，不建全量索引。HAP 里的代码在 `ets/modules.abc` 和其它 `*.abc`。`getmanifest` 读模块配置 `module.json`（没有则读 `config.json`）和包级 `pack.info`，并把 `$string:`、`$media:`、`$profile:` 换成 `resources/` 里的值。APK 清单里的 `@string/`、`@mipmap/` 和 `@0x7f......` 会换成 `resources.arsc` 或 `res/` 里的实际值。同一张表也写回 DEX：`getclass` 和 `dump` 里的常量、`R$type;->name`、字符串中的 `@string/`，以及 `findrefs` 命中的字符串和字段，都换成解析后的值。HAP 里 ABC 的类文本和字面量同样把 `$string:`、`$media:`、`$profile:` 换成资源值，所以按解析后的文本搜索也能命中。单独打开的 `.dex` 和 `.abc` 没有随包资源表，原文保持不动。`listclass`、`getclass`、`findrefs`、`getmanifest` 和 `dump` 可以直接读 HAP。
 

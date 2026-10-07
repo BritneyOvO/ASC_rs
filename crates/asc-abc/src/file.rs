@@ -80,11 +80,15 @@ impl<'a> Abc<'a> {
     }
 
     pub fn class_names(&self, prefix: Option<&str>) -> Result<Vec<String>> {
+        let prefix = match prefix {
+            Some(value) => Some(normalize_prefix(value)?),
+            None => None,
+        };
         let mut names = Vec::new();
         for index in 0..self.header.num_classes {
             let name = self.class_name(index)?;
-            if let Some(prefix) = prefix {
-                if !name.bytes.starts_with(prefix.as_bytes()) {
+            if let Some(prefix) = &prefix {
+                if !starts_with_package(name.bytes, prefix.as_bytes()) {
                     continue;
                 }
             }
@@ -559,21 +563,14 @@ fn literal_strings(data: &[u8], off: usize) -> Result<Vec<Name<'_>>> {
             .get(pos)
             .ok_or_else(|| crate::Error::new("truncated ABC literal"))?;
         pos += 1;
-        // ARRAY_STRING holds a count followed by that many string pointers.
-        if tag == 0x15 {
-            let n = u32_at(data, pos)? as usize;
-            pos += 4;
-            for _ in 0..n {
-                let str_off = u32_at(data, pos)? as usize;
-                pos += 4;
-                out.push(read_literal_string(data, str_off)?);
+        // Every statically typed array, ARRAY_STRING included, is one pointer
+        // to a buffer that carries its own length, and it ends the literal
+        // array. Only ARRAY_STRING's buffer holds strings.
+        if (0x0a..=0x15).contains(&tag) {
+            let pointer = u32_at(data, pos)? as usize;
+            if tag == 0x15 {
+                out.extend(read_string_array(data, pointer)?);
             }
-            break;
-        }
-        // Every other typed array is a single pointer to a buffer that carries
-        // its own length, and it always ends the literal array.
-        if (0x0a..=0x14).contains(&tag) {
-            let _ = u32_at(data, pos)?;
             break;
         }
         let Some(width) = literal_tag_width(tag) else {
@@ -595,6 +592,28 @@ fn literal_strings(data: &[u8], off: usize) -> Result<Vec<Name<'_>>> {
             pos += width;
         }
         index += 2;
+    }
+    Ok(out)
+}
+
+/// Reads an `ARRAY_STRING` payload: a count, then that many string pointers.
+///
+/// Upstream keeps the elements out of line (`literal_data_accessor-inl.h`
+/// reads one pointer for every `ARRAY_*` tag), so the tag in the array only
+/// says where the buffer is.
+fn read_string_array(data: &[u8], off: usize) -> Result<Vec<Name<'_>>> {
+    let count = u32_at(data, off)? as usize;
+    let mut pos = off + 4;
+    // The pointers have to fit in the buffer before the count sizes anything.
+    let remaining = data.len().saturating_sub(pos) / 4;
+    if count > remaining {
+        bail!("ABC string array at {off:#x} claims {count} entries");
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let str_off = u32_at(data, pos)? as usize;
+        pos += 4;
+        out.push(read_literal_string(data, str_off)?);
     }
     Ok(out)
 }
@@ -740,6 +759,37 @@ fn shorty_name(code: u16) -> &'static str {
         0x0c => "u64",
         0x0e => "any",
         _ => "unknown",
+    }
+}
+
+/// Normalizes a class prefix to a descriptor prefix, the way the DEX path does.
+///
+/// Unlike the DEX one this always folds `.` to `/`, so both `com.poc` and
+/// `Lcom.poc` reach an Ark ES descriptor, which may spell its package with dots.
+fn normalize_prefix(prefix: &str) -> Result<String> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        bail!("Class prefix cannot be empty");
+    }
+    let body = prefix.strip_prefix('L').unwrap_or(prefix).replace('.', "/");
+    Ok(format!("L{body}"))
+}
+
+/// Prefix match that treats `.` and `/` as the same separator, so a prefix can
+/// be written either way against either kind of descriptor.
+fn starts_with_package(name: &[u8], prefix: &[u8]) -> bool {
+    name.len() >= prefix.len()
+        && name[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(left, right)| separator(*left) == separator(*right))
+}
+
+fn separator(byte: u8) -> u8 {
+    if byte == b'.' {
+        b'/'
+    } else {
+        byte
     }
 }
 
@@ -1074,6 +1124,21 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_is_read_the_same_way_as_in_an_apk() {
+        // Real Ark ES descriptors spell their package with dots, and a dotted
+        // prefix has to reach them.
+        let data = abc_with_class_descriptors(&["Lcom.example/App;"]);
+        for prefix in ["com.example", "Lcom.example", "Lcom/example", "com/example"] {
+            assert_eq!(
+                class_names(&data, Some(prefix)).unwrap(),
+                vec!["Lcom.example/App;".to_string()],
+                "{prefix}"
+            );
+        }
+        assert!(class_names(&data, Some("com.other")).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_protoless_method_takes_its_signature_from_its_code() {
         let data = abc_with_a_protoless_method(true);
         let text = class_text(&data, "Ldemo/App;").unwrap();
@@ -1188,7 +1253,8 @@ mod tests {
         Str,
         /// A non-string entry carrying its tag byte and an inline value.
         Tag(u8),
-        /// ARRAY_STRING: a count followed by that many string pointers.
+        /// ARRAY_STRING: one pointer to an out of line `[count][pointers]`
+        /// buffer, the way upstream stores it.
         ArrayString(usize),
     }
 
@@ -1218,6 +1284,10 @@ mod tests {
         }
         let mut payload = Vec::new();
         payload.extend_from_slice(&(items.len() as u32 * 2).to_le_bytes());
+        // The ARRAY_STRING buffers are appended after the payload, so their
+        // pointers are patched once the payload length is known.
+        let mut array_strings: Vec<Vec<u32>> = Vec::new();
+        let mut patches: Vec<usize> = Vec::new();
         let mut next = 0;
         for item in items {
             let (tag, count) = match item {
@@ -1227,7 +1297,12 @@ mod tests {
             };
             payload.push(tag);
             if tag == 0x15 {
-                payload.extend_from_slice(&(count as u32).to_le_bytes());
+                // A single pointer; the count lives in the pointed-to buffer.
+                patches.push(payload.len());
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                array_strings.push(offsets[next..next + count].to_vec());
+                next += count;
+                continue;
             }
             for _ in 0..count {
                 payload.extend_from_slice(&offsets[next].to_le_bytes());
@@ -1251,7 +1326,16 @@ mod tests {
             }
         }
         let array_off = buf.len() as u32;
+        let payload_at = buf.len();
         buf.extend_from_slice(&payload);
+        for (slot, strings) in patches.into_iter().zip(array_strings) {
+            let buffer_off = buf.len() as u32;
+            put_u32(&mut buf, payload_at + slot, buffer_off);
+            buf.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+            for offset in strings {
+                buf.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
         let literal_idx_off = buf.len() as u32;
         buf.extend_from_slice(&array_off.to_le_bytes());
         let file_size = buf.len() as u32;
@@ -1331,6 +1415,45 @@ mod tests {
         for text in &expected {
             assert!(found.iter().any(|line| line.contains(text)), "{text} {found:?}");
         }
+    }
+
+    #[test]
+    fn an_array_string_pointer_is_not_read_as_a_count() {
+        // Upstream stores one pointer for `ARRAY_STRING`, and the count lives in
+        // the pointed-to buffer. Here the buffer sits 0x2000 bytes past the
+        // payload, so a reader that took those four bytes as an element count
+        // would chase thousands of bogus pointers.
+        let mut data = Vec::new();
+        let payload = 0u32;
+        data.extend_from_slice(&2u32.to_le_bytes()); // two entries
+        data.push(0x15);
+        let pointer_slot = data.len();
+        data.extend_from_slice(&0u32.to_le_bytes()); // patched below
+        while data.len() < 0x2000 {
+            data.push(0);
+        }
+        let buffer = data.len() as u32;
+        put_u32(&mut data, pointer_slot, buffer);
+        // The buffer is `[count][pointer, pointer]`, and the strings it points
+        // at follow it.
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let ptr0_slot = data.len();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let ptr1_slot = data.len();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let lit0 = data.len() as u32;
+        data.extend(panda_str("lit0"));
+        let lit1 = data.len() as u32;
+        data.extend(panda_str("lit1"));
+        put_u32(&mut data, ptr0_slot, lit0);
+        put_u32(&mut data, ptr1_slot, lit1);
+
+        let found = super::literal_strings(&data, payload as usize).unwrap();
+        let texts: Vec<&str> = found
+            .iter()
+            .map(|name| std::str::from_utf8(name.bytes).unwrap())
+            .collect();
+        assert_eq!(texts, vec!["lit0", "lit1"]);
     }
 
     #[test]

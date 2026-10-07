@@ -186,40 +186,79 @@ fn read_json_atom(bytes: &[u8], index: &mut usize) -> Option<String> {
     }
 }
 
+/// Reads a JSON string body. Bytes stay bytes, so a multi byte UTF-8 sequence
+/// survives; escapes are decoded, including `\uXXXX` surrogate pairs.
 fn read_json_string(bytes: &[u8], index: &mut usize) -> Option<String> {
     if bytes.get(*index) != Some(&b'"') {
         return None;
     }
     *index += 1;
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     while *index < bytes.len() {
         let byte = bytes[*index];
         *index += 1;
         match byte {
-            b'"' => return Some(out),
+            b'"' => return Some(String::from_utf8_lossy(&out).into_owned()),
             b'\\' => {
                 let escaped = *bytes.get(*index)?;
                 *index += 1;
                 match escaped {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    b'u' => {
-                        let hex = bytes.get(*index..*index + 4)?;
-                        let code = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-                        out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                        *index += 4;
-                    }
-                    other => out.push(other as char),
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'u' => read_json_escape(bytes, index, &mut out)?,
+                    other => out.push(other),
                 }
             }
-            byte => out.push(byte as char),
+            byte => out.push(byte),
         }
     }
     None
+}
+
+/// Decodes one `\uXXXX` escape, joining a surrogate pair when it is followed by
+/// its low half.
+fn read_json_escape(bytes: &[u8], index: &mut usize, out: &mut Vec<u8>) -> Option<()> {
+    let unit = read_json_hex4(bytes, index)?;
+    if !(0xd800..=0xdbff).contains(&unit) {
+        push_json_char(out, u32::from(unit));
+        return Some(());
+    }
+    let mut at = *index;
+    let low = if bytes.get(at) == Some(&b'\\') && bytes.get(at + 1) == Some(&b'u') {
+        at += 2;
+        read_json_hex4(bytes, &mut at).filter(|low| (0xdc00..=0xdfff).contains(low))
+    } else {
+        None
+    };
+    match low {
+        Some(low) => {
+            *index = at;
+            let code = 0x1_0000 + ((u32::from(unit) - 0xd800) << 10) + (u32::from(low) - 0xdc00);
+            push_json_char(out, code);
+        }
+        // An unpaired surrogate has no UTF-8 form.
+        None => push_json_char(out, 0xfffd),
+    }
+    Some(())
+}
+
+fn read_json_hex4(bytes: &[u8], index: &mut usize) -> Option<u16> {
+    let hex = bytes.get(*index..*index + 4)?;
+    let value = u16::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+    *index += 4;
+    Some(value)
+}
+
+fn push_json_char(out: &mut Vec<u8>, code: u32) {
+    let ch = char::from_u32(code).unwrap_or('\u{fffd}');
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
 }
 
 fn skip_ws(bytes: &[u8], index: &mut usize) {
@@ -271,4 +310,40 @@ fn json_escape(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_named_values;
+
+    fn pairs(json: &str) -> Vec<(String, String)> {
+        json_named_values(json)
+    }
+
+    #[test]
+    fn a_non_ascii_value_survives_the_scan() {
+        let found = pairs(r#"{"string":[{"name":"app_name","value":"中文测试值"}]}"#);
+        assert_eq!(
+            found,
+            vec![("app_name".to_string(), "中文测试值".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_surrogate_pair_becomes_one_code_point() {
+        let found = pairs(r#"{"string":[{"name":"emoji","value":"\ud83d\ude00"}]}"#);
+        assert_eq!(found, vec![("emoji".to_string(), "😀".to_string())]);
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_becomes_a_replacement_character() {
+        let found = pairs(r#"{"string":[{"name":"broken","value":"\ud83d"}]}"#);
+        assert_eq!(found, vec![("broken".to_string(), "\u{fffd}".to_string())]);
+    }
+
+    #[test]
+    fn control_escapes_are_decoded() {
+        let found = pairs(r#"{"string":[{"name":"tab","value":"a\tb\fc"}]}"#);
+        assert_eq!(found, vec![("tab".to_string(), "a\tb\u{c}c".to_string())]);
+    }
 }

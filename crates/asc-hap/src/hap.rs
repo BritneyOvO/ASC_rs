@@ -12,6 +12,10 @@ use memmap2::Mmap;
 use crate::{Error, Result};
 use asc_abc::{class_names, class_text_optional, find_members, find_strings_resolved, find_types};
 
+/// Ceiling on one inflated ZIP entry. A real `.abc` stays far below it, and a
+/// crafted entry can never make the reader allocate without bound.
+const MAX_INFLATED_BYTES: u64 = 1 << 30;
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub threads: usize,
@@ -54,7 +58,11 @@ pub fn is_hap(path: &Path) -> Result<bool> {
         Err(Error::Message(message)) if message.contains("EOCD") => return Ok(false),
         Err(err) => return Err(err),
     };
-    let entries = zip_entries(&map)?;
+    // A directory this reader cannot walk is not a HAP it can use; the APK path
+    // reports the damage.
+    let Ok(entries) = zip_entries(&map) else {
+        return Ok(false);
+    };
     Ok(entries.iter().any(|entry| is_hap_marker(&entry.name)))
 }
 
@@ -240,31 +248,82 @@ pub fn dump_hap(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     let (_file, map) = open_hap(path)?;
     let stored = zip_entries(&map)?;
     let resources = crate::resources::HapResources::index(&map, &stored);
-    for (name, text) in package_texts(&map, &stored, &resources)? {
-        let file_name = Path::new(&name)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("module.json"));
-        fs::write(out_dir.join(file_name), text)?;
-    }
     let mut classes = 0usize;
+    let mut errors = 0usize;
+    // One unreadable member must not cost the whole dump; every failure is
+    // reported and counted so the summary reflects what was left out.
+    match package_texts(&map, &stored, &resources) {
+        Ok(files) => {
+            for (name, text) in files {
+                let file_name = Path::new(&name)
+                    .file_name()
+                    .unwrap_or(std::ffi::OsStr::new("module.json"));
+                if let Err(err) = fs::write(out_dir.join(file_name), text) {
+                    errors += 1;
+                    eprintln!("warning: {name}: {err}");
+                }
+            }
+        }
+        Err(err) => {
+            errors += 1;
+            eprintln!("warning: {err}");
+        }
+    }
     for entry in code_entries(stored) {
-        let bytes = inflate(&map, &entry)?;
-        for name in class_names(&bytes, None)? {
-            let Some(text) = class_text_optional(&bytes, &name)? else {
+        let label = entry.name.clone();
+        let bytes = match inflate(&map, &entry) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                errors += 1;
+                eprintln!("warning: {label}: {err}");
                 continue;
+            }
+        };
+        let names = match class_names(&bytes, None) {
+            Ok(names) => names,
+            Err(err) => {
+                errors += 1;
+                eprintln!("warning: {label}: {err}");
+                continue;
+            }
+        };
+        for name in names {
+            let text = match class_text_optional(&bytes, &name) {
+                Ok(Some(text)) => text,
+                // The name came from this file, so not finding it again means
+                // the index and the class body disagree.
+                Ok(None) => {
+                    errors += 1;
+                    eprintln!("warning: {label}: {name} is indexed but has no body");
+                    continue;
+                }
+                Err(err) => {
+                    errors += 1;
+                    eprintln!("warning: {label}: {name}: {err}");
+                    continue;
+                }
             };
             let dest = class_output_path(out_dir, &name);
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+                if let Err(err) = fs::create_dir_all(parent) {
+                    errors += 1;
+                    eprintln!("warning: {name}: {err}");
+                    continue;
+                }
             }
-            fs::write(dest, resources.annotate(&text).as_bytes())?;
-            classes += 1;
+            match fs::write(&dest, resources.annotate(&text).as_bytes()) {
+                Ok(()) => classes += 1,
+                Err(err) => {
+                    errors += 1;
+                    eprintln!("warning: {}: {err}", dest.display());
+                }
+            }
         }
         if options.debug {
-            eprintln!("[HAP] dumped {}", entry.name);
+            eprintln!("[HAP] dumped {label}");
         }
     }
-    Ok(DumpStats { classes, errors: 0 })
+    Ok(DumpStats { classes, errors })
 }
 
 fn abc_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
@@ -356,6 +415,11 @@ fn pack_info_rank(name: &str) -> Option<u8> {
     }
 }
 
+/// Maps a descriptor to an output file.
+///
+/// Sanitizing alone is not injective: two descriptors can differ only in a
+/// character that has to be replaced. A changed part carries a short hash of
+/// the original so they stay distinct files.
 fn class_output_path(out_dir: &Path, descriptor: &str) -> PathBuf {
     let trimmed = descriptor
         .strip_prefix('L')
@@ -368,20 +432,32 @@ fn class_output_path(out_dir: &Path, descriptor: &str) -> PathBuf {
         return path;
     }
     for part in trimmed.split('/') {
-        let safe: String = part
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '-' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        path.push(if safe.is_empty() { "_" } else { &safe });
+        path.push(sanitize_part(part));
     }
     path.set_extension("ets");
     path
+}
+
+fn sanitize_part(part: &str) -> String {
+    let safe: String = part
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe == part && !safe.is_empty() {
+        return safe;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in part.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{safe}~{hash:08x}")
 }
 
 fn check_threads(threads: usize) -> Result<()> {
@@ -510,9 +586,23 @@ fn inflate_bytes(hap: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
     let data = match method {
         0 => comp.to_vec(),
         8 => {
-            let mut decoder = DeflateDecoder::new(comp);
+            // Deflate never expands more than 1032 times its input, so a larger
+            // declared size is a lie and the ratio bound is used instead. The
+            // hard ceiling keeps a crafted entry from allocating without bound.
+            let ratio_bound = (comp.len() as u64).saturating_mul(1032);
+            let declared = if uncompressed_size == 0 {
+                ratio_bound
+            } else {
+                uncompressed_size
+            };
+            let limit = declared.min(MAX_INFLATED_BYTES);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)?;
+            DeflateDecoder::new(comp)
+                .take(limit + 1)
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > limit {
+                bail!("zip entry {name} inflates past {limit} bytes");
+            }
             out
         }
         other => bail!("unsupported compression method: {other}"),
@@ -538,16 +628,14 @@ fn zip_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
     let mut ptr = start;
     let mut index = 0u32;
     while ptr + 46 <= end {
-        let Some((maybe, next)) = read_cd_record(data, ptr, end)? else {
-            break;
-        };
+        let (maybe, next) = read_cd_record(data, ptr, end)?;
         if let Some(mut entry) = maybe {
             entry.index = index;
             index += 1;
             entries.push(entry);
         }
         if next <= ptr {
-            break;
+            bail!("central directory record at {ptr:#x} does not advance");
         }
         ptr = next;
     }
@@ -593,13 +681,21 @@ fn zip64_cd_bounds(data: &[u8], eocd: usize) -> Result<(u64, u64)> {
     Ok((u64_at(data, at + 48)?, u64_at(data, at + 40)?))
 }
 
+/// Reads one central directory record.
+///
+/// A record that cannot be trusted is an error rather than a stop condition:
+/// stopping quietly would drop every entry after it, which reads as "the
+/// archive has no such file" instead of "the directory is damaged".
 fn read_cd_record(
     data: &[u8],
     header: usize,
     cd_end: usize,
-) -> Result<Option<(Option<ZipEntry>, usize)>> {
-    if header + 46 > cd_end || data.get(header..header + 4) != Some(b"PK\x01\x02") {
-        return Ok(None);
+) -> Result<(Option<ZipEntry>, usize)> {
+    if header + 46 > cd_end {
+        bail!("central directory record at {header:#x} runs past the directory");
+    }
+    if data.get(header..header + 4) != Some(b"PK\x01\x02") {
+        bail!("central directory record at {header:#x} has a bad signature");
     }
     let method = u16_at(data, header + 10)?;
     let crc = u32_at(data, header + 16)?;
@@ -615,7 +711,7 @@ fn read_cd_record(
     let extra_end = extra_start + extra_len;
     let next = extra_end + comment_len;
     if next > cd_end || next > data.len() {
-        return Ok(None);
+        bail!("central directory record at {header:#x} runs past the archive");
     }
     let (uncomp_size, comp_size, local_off, disk) = zip64_resolve(
         &data[extra_start..extra_end],
@@ -625,9 +721,10 @@ fn read_cd_record(
         disk,
     )?;
     if disk != 0 {
-        return Ok(Some((None, next)));
+        // Multi disk archives are not supported; keep walking past the entry.
+        return Ok((None, next));
     }
-    Ok(Some((
+    Ok((
         Some(ZipEntry {
             name: String::from_utf8_lossy(&data[name_start..name_start + name_len]).into_owned(),
             crc,
@@ -638,7 +735,7 @@ fn read_cd_record(
             index: 0,
         }),
         next,
-    )))
+    ))
 }
 
 fn zip64_resolve(
@@ -707,15 +804,34 @@ fn zip64_u64(data: &[u8], pos: &mut usize) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+/// Finds the end of central directory record. The archive comment may hold any
+/// bytes, including this signature, so a candidate only counts when its
+/// declared comment length reaches the end of the file.
 fn find_eocd(data: &[u8]) -> Option<usize> {
     if data.len() < 22 {
         return None;
     }
     let search_start = data.len().saturating_sub(65536 + 22);
     let tail = &data[search_start..];
-    tail.windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
-        .map(|rel| search_start + rel)
+    let mut fallback = None;
+    for rel in (0..tail.len().saturating_sub(3)).rev() {
+        if &tail[rel..rel + 4] != b"PK\x05\x06" {
+            continue;
+        }
+        let at = search_start + rel;
+        if at + 22 > data.len() {
+            continue;
+        }
+        let comment_len = u16::from_le_bytes([data[at + 20], data[at + 21]]) as usize;
+        let end = at + 22 + comment_len;
+        if end == data.len() {
+            return Some(at);
+        }
+        if end < data.len() && fallback.is_none() {
+            fallback = Some(at);
+        }
+    }
+    fallback
 }
 
 fn u16_at(data: &[u8], off: usize) -> Result<u16> {
@@ -1016,5 +1132,102 @@ mod tests {
         data[20..24].copy_from_slice(b"PK\x05\x06");
         let err = zip64_cd_bounds(&data, 20).unwrap_err();
         assert!(err.to_string().contains("ZIP64 EOCD offset"), "{err}");
+    }
+
+    /// An end of central directory record with the given archive comment.
+    fn eocd_with_comment(comment: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(b"PK\x05\x06");
+        archive.extend_from_slice(&[0u8; 8]); // disk, entries fields
+        archive.extend_from_slice(&0u32.to_le_bytes()); // central directory size
+        archive.extend_from_slice(&0u32.to_le_bytes()); // central directory offset
+        archive.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        archive.extend_from_slice(comment);
+        archive
+    }
+
+    #[test]
+    fn a_comment_holding_the_eocd_signature_does_not_shadow_the_record() {
+        use super::find_eocd;
+        let comment = b"see PK\x05\x06 inside";
+        let archive = eocd_with_comment(comment);
+        assert_eq!(find_eocd(&archive), Some(0), "comment={comment:?}");
+    }
+
+    #[test]
+    fn a_damaged_central_directory_record_is_an_error() {
+        use super::{cd_bounds, zip_entries};
+        let mut archive = vec![0u8; 46];
+        archive[0..4].copy_from_slice(b"XXXX");
+        archive.extend_from_slice(b"PK\x05\x06");
+        archive.extend_from_slice(&[0u8; 8]);
+        archive.extend_from_slice(&46u32.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(cd_bounds(&archive).unwrap(), (0, 46));
+        let Err(err) = zip_entries(&archive) else {
+            panic!("a damaged record must be reported");
+        };
+        assert!(err.to_string().contains("bad signature"), "{err}");
+    }
+
+    #[test]
+    fn a_lying_uncompressed_size_bounds_the_inflation() {
+        use std::io::Write;
+
+        use super::{inflate_bytes, ZipBytes};
+        let payload = vec![0u8; 1 << 20];
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut archive = vec![0u8; 30];
+        archive[0..4].copy_from_slice(b"PK\x03\x04");
+        archive.extend_from_slice(&compressed);
+        let entry = ZipBytes {
+            name: "ets/modules.abc",
+            method: 8,
+            crc: 0,
+            compressed_size: compressed.len() as u64,
+            uncompressed_size: 16,
+            header_offset: 0,
+        };
+        let err = inflate_bytes(&archive, entry).unwrap_err();
+        assert!(err.to_string().contains("inflates past"), "{err}");
+    }
+
+    #[test]
+    fn distinct_descriptors_never_share_an_output_path() {
+        use super::class_output_path;
+        use std::path::Path;
+        let left = class_output_path(Path::new("out"), "La.b;");
+        let right = class_output_path(Path::new("out"), "La_b;");
+        assert_ne!(left, right, "{left:?} {right:?}");
+        assert_eq!(
+            class_output_path(Path::new("out"), "Ldemo/App;"),
+            Path::new("out/demo/App.ets")
+        );
+    }
+
+    #[test]
+    fn a_dump_keeps_the_members_it_can_read() {
+        let abc = sample_abc();
+        let hap = zip_stored(&[
+            ("module.json", br#"{"module":{"name":"entry"}}"#),
+            ("pack.info", br#"{}"#),
+            ("ets/modules.abc", abc.as_slice()),
+            ("libs/broken.abc", b"NOT-AN-ABC-FILE"),
+        ]);
+        let dir = std::env::temp_dir().join(format!("asc-hap-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entry.hap");
+        std::fs::write(&path, hap).unwrap();
+        let stats = dump_hap(&path, &dir.join("out"), &options()).unwrap();
+        // The readable member is still written, and the broken one is counted
+        // rather than ending the dump.
+        assert!(stats.classes >= 1, "{stats:?}");
+        assert!(stats.errors >= 1, "{stats:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

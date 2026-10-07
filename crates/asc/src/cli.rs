@@ -139,9 +139,14 @@ enum FindCmd {
     Method {
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Member name. It is an anchored regular expression unless `--class`
+        /// names one exact class, which switches it to an exact string.
         name: Option<String>,
+        /// Class to look in: a full descriptor or a dotted name. With
+        /// `--fuzzy-class` it is a literal substring of the class name.
         #[arg(long = "class")]
         class_name: Option<String>,
+        /// Match `--class` anywhere in the class name instead of exactly.
         #[arg(long = "fuzzy-class")]
         fuzzy_class: bool,
     },
@@ -149,9 +154,14 @@ enum FindCmd {
     Field {
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Member name. It is an anchored regular expression unless `--class`
+        /// names one exact class, which switches it to an exact string.
         name: Option<String>,
+        /// Class to look in: a full descriptor or a dotted name. With
+        /// `--fuzzy-class` it is a literal substring of the class name.
         #[arg(long = "class")]
         class_name: Option<String>,
+        /// Match `--class` anywhere in the class name instead of exactly.
         #[arg(long = "fuzzy-class")]
         fuzzy_class: bool,
     },

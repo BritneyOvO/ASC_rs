@@ -3,7 +3,7 @@
 //! Default configurations win over qualified ones, matching an unqualified
 //! `@string/name`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::Result;
 
@@ -11,16 +11,26 @@ use crate::Result;
 pub struct ResourceTable {
     by_id: HashMap<u32, Slot>,
     by_name: HashMap<(String, String), Slot>,
+    /// Package names this table declares. `@android:type/name` names a package
+    /// the table does not own, so it must not be resolved against it.
+    packages: HashSet<String>,
 }
 
 struct Slot {
     value: String,
     default_config: bool,
+    /// The value is already a Java literal (a number, boolean, or colour), so
+    /// the code writer must not quote it.
+    literal: bool,
 }
 
 enum RefToken {
     Id(u32),
-    Name { type_name: String, entry: String },
+    Name {
+        package: Option<String>,
+        type_name: String,
+        entry: String,
+    },
 }
 
 impl ResourceTable {
@@ -79,6 +89,7 @@ impl ResourceTable {
             Slot {
                 value: zip_name.to_string(),
                 default_config: dir == type_name,
+                literal: false,
             },
         );
     }
@@ -121,8 +132,8 @@ impl ResourceTable {
                 }
                 if chars[index] == '@' || chars[index] == '?' {
                     if let Some((len, token)) = parse_ref(&chars[index..]) {
-                        if let Some(value) = self.lookup(&token) {
-                            out.push_str(&escape_code(value));
+                        if let Some(slot) = self.lookup(&token) {
+                            out.push_str(&escape_code(&slot.value));
                             index += len;
                             continue;
                         }
@@ -140,25 +151,29 @@ impl ResourceTable {
             }
             if chars[index] == 'R' && chars.get(index + 1) == Some(&'$') {
                 if let Some((start, len, type_name, entry)) = parse_r_field(&chars, index) {
-                    if let Some(value) = self.lookup(&RefToken::Name { type_name, entry }) {
+                    if let Some(slot) = self.lookup(&RefToken::Name {
+                        package: None,
+                        type_name,
+                        entry,
+                    }) {
                         drop_chars(&mut out, index - start);
-                        out.push_str(&quote_code(value));
+                        out.push_str(&quote_code(&slot.value, slot.literal));
                         index += len;
                         continue;
                     }
                 }
             }
             if let Some((len, id)) = parse_code_number(&chars, index) {
-                if let Some(value) = self.by_id.get(&id).map(|slot| slot.value.as_str()) {
-                    out.push_str(&quote_code(value));
+                if let Some(slot) = self.by_id.get(&id) {
+                    out.push_str(&quote_code(&slot.value, slot.literal));
                     index += len;
                     continue;
                 }
             }
             if chars[index] == '@' || chars[index] == '?' {
                 if let Some((len, token)) = parse_ref(&chars[index..]) {
-                    if let Some(value) = self.lookup(&token) {
-                        out.push_str(&quote_code(value));
+                    if let Some(slot) = self.lookup(&token) {
+                        out.push_str(&quote_code(&slot.value, slot.literal));
                         index += len;
                         continue;
                     }
@@ -221,8 +236,8 @@ impl ResourceTable {
         while index < chars.len() {
             if chars[index] == '@' || chars[index] == '?' {
                 if let Some((len, token)) = parse_ref(&chars[index..]) {
-                    if let Some(value) = self.lookup(&token) {
-                        out.push_str(&render(value));
+                    if let Some(slot) = self.lookup(&token) {
+                        out.push_str(&render(&slot.value));
                     } else {
                         out.extend(chars[index..index + len].iter().copied());
                     }
@@ -236,18 +251,29 @@ impl ResourceTable {
         out
     }
 
-    fn lookup(&self, token: &RefToken) -> Option<&str> {
-        let value = match token {
-            RefToken::Id(id) => self.by_id.get(id).map(|slot| slot.value.as_str()),
-            RefToken::Name { type_name, entry } => self
-                .by_name
-                .get(&(type_name.clone(), entry.clone()))
-                .map(|slot| slot.value.as_str()),
+    fn lookup(&self, token: &RefToken) -> Option<&Slot> {
+        let slot = match token {
+            RefToken::Id(id) => self.by_id.get(id),
+            RefToken::Name {
+                package,
+                type_name,
+                entry,
+            } => {
+                // `@android:string/ok` belongs to another package. Resolving it
+                // against this table would return the app's own `string/ok`.
+                if package
+                    .as_ref()
+                    .is_some_and(|name| !self.packages.contains(name))
+                {
+                    return None;
+                }
+                self.by_name.get(&(type_name.clone(), entry.clone()))
+            }
         }?;
-        if value.is_empty() {
+        if slot.value.is_empty() {
             None
         } else {
-            Some(value)
+            Some(slot)
         }
     }
 
@@ -259,6 +285,10 @@ impl ResourceTable {
         let package_id = u32_at(chunk, 8)?;
         if chunk.len() < 280 {
             bail!("truncated resource package");
+        }
+        // The package header carries a 128 code unit UTF-16LE name at offset 12.
+        if let Some(name) = read_package_name(&chunk[12..268]) {
+            self.packages.insert(name);
         }
         let type_off = u32_at(chunk, 268)? as usize;
         let key_off = u32_at(chunk, 276)? as usize;
@@ -315,14 +345,21 @@ impl ResourceTable {
             else {
                 continue;
             };
-            let Some((key, value)) = read_entry(chunk, entry_at, global) else {
+            let Some((key, value, literal)) = read_entry(chunk, entry_at, global) else {
                 continue;
             };
             let Some(entry_name) = key_pool.get(key as usize) else {
                 continue;
             };
             let res_id = (package_id << 24) | (u32::from(id) << 16) | (entry_index as u32);
-            self.insert(res_id, type_name, entry_name, value, default_config);
+            self.insert(
+                res_id,
+                type_name,
+                entry_name,
+                value,
+                default_config,
+                literal,
+            );
         }
         Ok(())
     }
@@ -343,6 +380,7 @@ impl ResourceTable {
         entry: &str,
         value: String,
         default_config: bool,
+        literal: bool,
     ) {
         insert_slot(
             &mut self.by_id,
@@ -350,6 +388,7 @@ impl ResourceTable {
             Slot {
                 value: value.clone(),
                 default_config,
+                literal,
             },
         );
         insert_slot(
@@ -358,6 +397,7 @@ impl ResourceTable {
             Slot {
                 value,
                 default_config,
+                literal,
             },
         );
     }
@@ -387,8 +427,10 @@ impl ResourceTable {
                 continue;
             }
             let resolved = target.value.clone();
+            let resolved_literal = target.literal;
             if let Some(slot) = self.by_id.get_mut(&id) {
                 slot.value = resolved.clone();
+                slot.literal = resolved_literal;
             }
             let Some(keys) = name_keys.get(&current) else {
                 continue;
@@ -396,17 +438,27 @@ impl ResourceTable {
             for key in keys {
                 if let Some(slot) = self.by_name.get_mut(key) {
                     slot.value = resolved.clone();
+                    slot.literal = resolved_literal;
                 }
             }
         }
     }
 }
 
+/// Picks the value to keep when several configurations define one resource.
+///
+/// The table is read in file order, so the rule has to be order independent:
+/// a default configuration wins over a qualified one, a default that arrives
+/// later replaces a qualified value that arrived earlier, and between two
+/// equally qualified values the first is kept.
 fn insert_slot<K: Eq + std::hash::Hash>(map: &mut HashMap<K, Slot>, key: K, slot: Slot) {
     match map.get(&key) {
-        Some(old) if old.default_config && !slot.default_config => {}
-        Some(old) if !old.default_config && !slot.default_config => {}
-        _ => {
+        Some(old) if old.default_config => {}
+        Some(_) if slot.default_config => {
+            map.insert(key, slot);
+        }
+        Some(_) => {}
+        None => {
             map.insert(key, slot);
         }
     }
@@ -441,7 +493,7 @@ fn entry_offset(
     }
 }
 
-fn read_entry(chunk: &[u8], at: usize, global: &[String]) -> Option<(u32, String)> {
+fn read_entry(chunk: &[u8], at: usize, global: &[String]) -> Option<(u32, String, bool)> {
     if at + 8 > chunk.len() {
         return None;
     }
@@ -457,38 +509,48 @@ fn read_entry(chunk: &[u8], at: usize, global: &[String]) -> Option<(u32, String
     }
     let data_type = *chunk.get(value_at + 3)?;
     let data = u32_at(chunk, value_at + 4).ok()?;
-    render_value(data_type, data, global).map(|value| (key, value))
+    render_value(data_type, data, global).map(|(value, literal)| (key, value, literal))
 }
 
-fn render_value(data_type: u8, data: u32, global: &[String]) -> Option<String> {
+/// Renders one `Res_value`. The flag says whether the text is already a Java
+/// literal, which is what decides whether the code writer quotes it.
+fn render_value(data_type: u8, data: u32, global: &[String]) -> Option<(String, bool)> {
     match data_type {
         0x00 => None,
-        0x01 => Some(format!("@0x{data:08x}")),
-        0x03 => global.get(data as usize).cloned(),
-        0x04 => Some(f32::from_bits(data).to_string()),
-        0x10 => Some(i32::from_le_bytes(data.to_le_bytes()).to_string()),
-        0x11 => Some(format!("{data:#x}")),
-        0x12 => Some(if data == 0 {
-            "false".to_string()
-        } else {
-            "true".to_string()
-        }),
-        0x1c..=0x1f => Some(format!("#{data:08x}")),
-        _ => Some(format!("@0x{data:08x}")),
+        0x01 => Some((format!("@0x{data:08x}"), false)),
+        0x03 => global.get(data as usize).cloned().map(|text| (text, false)),
+        0x04 => Some((f32::from_bits(data).to_string(), true)),
+        0x10 => Some((i32::from_le_bytes(data.to_le_bytes()).to_string(), true)),
+        0x11 => Some((format!("{data:#x}"), true)),
+        0x12 => Some((
+            if data == 0 {
+                "false".to_string()
+            } else {
+                "true".to_string()
+            },
+            true,
+        )),
+        0x1c..=0x1f => Some((format!("#{data:08x}"), true)),
+        _ => Some((format!("@0x{data:08x}"), false)),
     }
 }
 
+/// Whether a `ResTable_type` carries the unqualified configuration.
+///
+/// Every qualifier counts: density, uiMode (night), sdkVersion, orientation,
+/// and the rest. Looking only at mcc/mnc/locale would call a `-xhdpi` or
+/// `-night` chunk a default, and that chunk would then displace the real one.
 fn is_default_config(chunk: &[u8]) -> bool {
-    if chunk.len() < 28 {
+    if chunk.len() < 24 {
         return true;
     }
+    // `ResTable_type` has a 20 byte header, then a `ResTable_config` that
+    // starts with its own size. The size includes those four bytes.
     let size = u32_at(chunk, 20).unwrap_or(0) as usize;
-    if size < 16 || 20 + size > chunk.len() {
+    if size < 4 || 20 + size > chunk.len() {
         return true;
     }
-    let mcc = u16_at(chunk, 24).unwrap_or(1);
-    let mnc = u16_at(chunk, 26).unwrap_or(1);
-    mcc == 0 && mnc == 0 && chunk[28] == 0 && chunk[30] == 0
+    chunk[24..20 + size].iter().all(|byte| *byte == 0)
 }
 
 fn parse_ref(chars: &[char]) -> Option<(usize, RefToken)> {
@@ -512,20 +574,22 @@ fn parse_ref(chars: &[char]) -> Option<(usize, RefToken)> {
         let id = u32::from_str_radix(&hex, 16).ok()?;
         return Some((index, RefToken::Id(id)));
     }
-    let (type_end, type_name) = read_ident(chars, index)?;
-    index = type_end;
+    let (name_end, first) = read_ref_ident(chars, index)?;
+    index = name_end;
     if chars.get(index) == Some(&':') {
+        // `@package:type/name`: the leading ident names a package.
         index += 1;
-        let (name_end, entry) = read_ident(chars, index)?;
-        if chars.get(name_end) != Some(&'/') {
+        let (type_end, type_name) = read_ident(chars, index)?;
+        if chars.get(type_end) != Some(&'/') {
             return None;
         }
-        let (entry_end, real_entry) = read_ident(chars, name_end + 1)?;
+        let (entry_end, entry) = read_ident(chars, type_end + 1)?;
         return Some((
             entry_end,
             RefToken::Name {
-                type_name: entry,
-                entry: real_entry,
+                package: Some(first),
+                type_name,
+                entry,
             },
         ));
     }
@@ -533,7 +597,31 @@ fn parse_ref(chars: &[char]) -> Option<(usize, RefToken)> {
         return None;
     }
     let (entry_end, entry) = read_ident(chars, index + 1)?;
-    Some((entry_end, RefToken::Name { type_name, entry }))
+    Some((
+        entry_end,
+        RefToken::Name {
+            package: None,
+            type_name: first,
+            entry,
+        },
+    ))
+}
+
+/// The 128 UTF-16 code units at the start of a `ResTable_package` header.
+fn read_package_name(bytes: &[u8]) -> Option<String> {
+    let mut units = Vec::new();
+    for pair in bytes.as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes(*pair);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    if units.is_empty() {
+        None
+    } else {
+        Some(String::from_utf16_lossy(&units))
+    }
 }
 
 fn has_at_ref(bytes: &[u8]) -> bool {
@@ -541,10 +629,20 @@ fn has_at_ref(bytes: &[u8]) -> bool {
 }
 
 fn read_ident(chars: &[char], start: usize) -> Option<(usize, String)> {
+    read_ident_with(chars, start, false)
+}
+
+/// The leading identifier of a reference, which may carry dots when it names a
+/// package (`@com.example.app:string/name`).
+fn read_ref_ident(chars: &[char], start: usize) -> Option<(usize, String)> {
+    read_ident_with(chars, start, true)
+}
+
+fn read_ident_with(chars: &[char], start: usize, dots: bool) -> Option<(usize, String)> {
     let mut index = start;
     while chars
         .get(index)
-        .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || (dots && *ch == '.'))
     {
         index += 1;
     }
@@ -743,9 +841,11 @@ fn escape_code(value: &str) -> String {
     out
 }
 
-fn quote_code(value: &str) -> String {
-    if value == "true" || value == "false" || value.starts_with('#') || value.parse::<i64>().is_ok()
-    {
+/// Writes a resource value into code. Only a value the table itself typed as a
+/// number, boolean, or colour is already a literal; a string resource that
+/// happens to read `1234` or `#ff0000` still needs its quotes.
+fn quote_code(value: &str, literal: bool) -> String {
+    if literal {
         return value.to_string();
     }
     format!("\"{}\"", escape_code(value))
@@ -819,7 +919,9 @@ mod tests {
         pool
     }
 
-    fn string_type_chunk() -> Vec<u8> {
+    /// One `ResTable_type` with a single entry, under a config whose only
+    /// qualifier is `density`.
+    fn type_chunk(density: u16, data_type: u8, data: u32) -> Vec<u8> {
         let config_size = 28u32;
         let header_size = 20 + config_size as usize;
         let entries_start = header_size + 4;
@@ -830,15 +932,74 @@ mod tests {
         put_u32(&mut chunk, 12, 1);
         put_u32(&mut chunk, 16, entries_start as u32);
         put_u32(&mut chunk, 20, config_size);
+        put_u16(&mut chunk, 20 + 14, density); // ResTable_config.density
         put_u32(&mut chunk, header_size, 0);
         put_u16(&mut chunk, entries_start, 8);
         put_u32(&mut chunk, entries_start + 4, 0);
         put_u16(&mut chunk, entries_start + 8, 8);
-        chunk[entries_start + 11] = 0x03;
-        put_u32(&mut chunk, entries_start + 12, 0);
+        chunk[entries_start + 11] = data_type;
+        put_u32(&mut chunk, entries_start + 12, data);
         let len = chunk.len() as u32;
         put_u32(&mut chunk, 4, len);
         chunk
+    }
+
+    fn string_type_chunk() -> Vec<u8> {
+        type_chunk(0, 0x03, 0)
+    }
+
+    fn arsc_table(global: Vec<u8>, mut package: Vec<u8>) -> Vec<u8> {
+        let package_len = package.len() as u32;
+        put_u32(&mut package, 4, package_len);
+        let mut table = vec![0u8; 12];
+        put_u16(&mut table, 0, 0x0002);
+        put_u16(&mut table, 2, 12);
+        put_u32(&mut table, 8, 1);
+        table.extend(global);
+        table.extend(package);
+        let table_len = table.len() as u32;
+        put_u32(&mut table, 4, table_len);
+        table
+    }
+
+    /// A package header whose own name is `com.example.app`, so cross package
+    /// references can be exercised.
+    fn example_package(type_pool: Vec<u8>, key_pool: Vec<u8>) -> Vec<u8> {
+        let mut package = vec![0u8; 288];
+        put_u16(&mut package, 0, 0x0200);
+        put_u16(&mut package, 2, 288);
+        put_u32(&mut package, 8, 0x7f);
+        for (index, unit) in "com.example.app".encode_utf16().enumerate() {
+            let at = 12 + index * 2;
+            package[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let type_off = package.len();
+        package.extend(type_pool);
+        let key_off = package.len();
+        package.extend(key_pool);
+        put_u32(&mut package, 268, type_off as u32);
+        put_u32(&mut package, 276, key_off as u32);
+        package
+    }
+
+    /// A table with one `string/app_name` entry per variant, written in the
+    /// order given as `(value, density)`.
+    fn arsc_with_string_variants(variants: &[(&str, u16)]) -> Vec<u8> {
+        let values: Vec<&str> = variants.iter().map(|(value, _)| *value).collect();
+        let global = utf8_pool(&values);
+        let mut package = example_package(utf8_pool(&["string"]), utf8_pool(&["app_name"]));
+        for (index, (_, density)) in variants.iter().enumerate() {
+            package.extend(type_chunk(*density, 0x03, index as u32));
+        }
+        arsc_table(global, package)
+    }
+
+    /// A table with one entry of an arbitrary `Res_value` type.
+    fn arsc_with_single(type_name: &str, key_name: &str, data_type: u8, data: u32) -> Vec<u8> {
+        let global = utf8_pool(&[]);
+        let mut package = example_package(utf8_pool(&[type_name]), utf8_pool(&[key_name]));
+        package.extend(type_chunk(0, data_type, data));
+        arsc_table(global, package)
     }
 
     fn sample_arsc() -> Vec<u8> {
@@ -856,17 +1017,7 @@ mod tests {
         put_u32(&mut package, 268, type_off as u32);
         put_u32(&mut package, 276, key_off as u32);
         package.extend(string_type_chunk());
-        let package_len = package.len() as u32;
-        put_u32(&mut package, 4, package_len);
-        let mut table = vec![0u8; 12];
-        put_u16(&mut table, 0, 0x0002);
-        put_u16(&mut table, 2, 12);
-        put_u32(&mut table, 8, 1);
-        table.extend(global);
-        table.extend(package);
-        let table_len = table.len() as u32;
-        put_u32(&mut table, 4, table_len);
-        table
+        arsc_table(global, package)
     }
 
     #[test]
@@ -949,5 +1100,55 @@ mod tests {
             panic!("a length the buffer cannot back must be rejected");
         };
         assert!(err.to_string().contains("resource string"), "{err}");
+    }
+
+    #[test]
+    fn a_density_variant_does_not_displace_the_default() {
+        // The default value comes first, an xhdpi variant with a different
+        // value second. The variant is not a default, so it must not win.
+        let table =
+            ResourceTable::parse(&arsc_with_string_variants(&[("day", 0), ("dense", 320)]))
+                .unwrap();
+        assert_eq!(table.rewrite_plain("@string/app_name"), "day");
+    }
+
+    #[test]
+    fn a_late_default_still_beats_an_earlier_variant() {
+        let table =
+            ResourceTable::parse(&arsc_with_string_variants(&[("dense", 320), ("day", 0)]))
+                .unwrap();
+        assert_eq!(table.rewrite_plain("@string/app_name"), "day");
+    }
+
+    #[test]
+    fn a_numeric_string_resource_keeps_its_quotes() {
+        for value in ["257429317626902", "#ff0000", "true"] {
+            let table = ResourceTable::parse(&arsc_with_string_variants(&[(value, 0)])).unwrap();
+            let code = table.rewrite_code("sget v0, Lcom/example/R$string;->app_name\n");
+            assert!(code.contains(&format!("\"{value}\"")), "{value}: {code}");
+        }
+    }
+
+    #[test]
+    fn an_integer_resource_stays_a_literal() {
+        let table = ResourceTable::parse(&arsc_with_single("integer", "count", 0x10, 42)).unwrap();
+        let code = table.rewrite_code("sget v0, Lcom/example/R$integer;->count\n");
+        assert!(code.contains("sget v0, 42"), "{code}");
+    }
+
+    #[test]
+    fn a_reference_to_another_package_is_left_alone() {
+        let table = ResourceTable::parse(&arsc_with_string_variants(&[("local", 0)])).unwrap();
+        assert_eq!(table.rewrite_plain("@string/app_name"), "local");
+        // `android` is not a package of this table, so the reference stays even
+        // though a same named `string/app_name` exists here.
+        assert_eq!(
+            table.rewrite_plain("@android:string/app_name"),
+            "@android:string/app_name"
+        );
+        assert_eq!(
+            table.rewrite_plain("@com.example.app:string/app_name"),
+            "local"
+        );
     }
 }

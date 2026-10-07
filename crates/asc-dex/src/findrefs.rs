@@ -407,12 +407,19 @@ fn member_query(kind: Kind, sel: &MemberSel) -> Result<MemberQuery> {
     }
 }
 
+/// Turns a class name into a literal substring pattern.
+///
+/// Dotted names are read as package separators, but only when the name uses no
+/// slash at all: an Ark ES class descriptor really does contain dots. The rest
+/// is escaped, so `Foo$Bar` matches the inner class instead of reading `$` as
+/// an end of text anchor.
 fn fuzzy_class(name: &str) -> String {
-    if name.contains('.') && !name.contains('/') {
+    let slashed = if name.contains('.') && !name.contains('/') {
         name.replace('.', "/")
     } else {
         name.to_string()
-    }
+    };
+    regex::escape(&slashed)
 }
 
 impl InsnLocator {
@@ -652,7 +659,7 @@ fn scan_group(
 
 #[cfg(test)]
 mod tests {
-    use super::has_at_ref;
+    use super::{byte_regex, fuzzy_class, has_at_ref};
 
     #[test]
     fn only_real_resource_tokens_look_like_references() {
@@ -671,5 +678,22 @@ mod tests {
         for plain in ["colou?r", "https://example.com/a?b=c", "what?", "?", "?nope"] {
             assert!(!has_at_ref(plain.as_bytes()), "{plain}");
         }
+    }
+
+    #[test]
+    fn a_fuzzy_class_name_matches_its_inner_class_literally() {
+        // `$` and `(` in a mangled name are text, not pattern syntax.
+        let pattern = fuzzy_class("Azeroth2$mDefault$2");
+        let regex = byte_regex(&pattern).unwrap();
+        assert!(regex.is_match(b"Lcom/kwai/Azeroth2$mDefault$2;"));
+        assert!(regex.is_match(b"Lcom/kwai/Other(Azeroth2$mDefault$2);"));
+        assert!(!regex.is_match(b"Lcom/kwai/Azeroth2XmDefaultY2;"));
+    }
+
+    #[test]
+    fn a_dotted_fuzzy_class_name_is_read_as_a_package_path() {
+        let pattern = fuzzy_class("com.example.Foo");
+        let regex = byte_regex(&pattern).unwrap();
+        assert!(regex.is_match(b"Lcom/example/Foo;"));
     }
 }

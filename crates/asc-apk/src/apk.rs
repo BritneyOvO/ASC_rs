@@ -22,6 +22,10 @@ use asc_dex::{
     Dex, RefQuery,
 };
 
+/// Ceiling on one inflated ZIP entry. A real DEX stays far below it, and a
+/// crafted entry can never make the reader allocate without bound.
+const MAX_INFLATED_BYTES: u64 = 1 << 30;
+
 /// Which decompiler writes method bodies for `getclass` and `dump`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Engine {
@@ -474,6 +478,12 @@ fn sort_by_load_order(entries: &mut [DexEntry]) {
     });
 }
 
+/// Maps a descriptor to an output file.
+///
+/// Sanitizing alone is not injective: `La.b;` and `La_b;` both become `a_b`, and
+/// one class would silently overwrite the other. A part that has to be changed
+/// gets a suffix derived from the original, so distinct descriptors stay
+/// distinct files.
 fn class_output_path(out_dir: &Path, descriptor: &str, extension: &str) -> PathBuf {
     let trimmed = descriptor
         .strip_prefix('L')
@@ -482,21 +492,7 @@ fn class_output_path(out_dir: &Path, descriptor: &str, extension: &str) -> PathB
     let mut dest = out_dir.to_path_buf();
     let parts: Vec<&str> = trimmed.split('/').collect();
     for (index, part) in parts.iter().enumerate() {
-        let safe: String = part
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '$' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let name = if safe.is_empty() {
-            "_".to_string()
-        } else {
-            safe
-        };
+        let name = sanitize_part(part);
         if index + 1 == parts.len() {
             dest.push(format!("{name}.{extension}"));
         } else {
@@ -504,6 +500,30 @@ fn class_output_path(out_dir: &Path, descriptor: &str, extension: &str) -> PathB
         }
     }
     dest
+}
+
+/// Keeps the characters a filesystem path can hold as they are, and replaces
+/// the rest. A changed part carries a short hash of the original.
+fn sanitize_part(part: &str) -> String {
+    let safe: String = part
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '$' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe == part && !safe.is_empty() {
+        return safe;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in part.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{safe}~{hash:08x}")
 }
 
 pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec<String>> {
@@ -571,9 +591,9 @@ fn manifest_text(apk: &[u8], resources: &crate::arsc::ResourceTable) -> Result<S
 
 fn load_resource_table(apk: &[u8]) -> crate::arsc::ResourceTable {
     let Ok(entries) = all_zip_entries(apk) else {
+        eprintln!("warning: resource references are unavailable: unreadable central directory");
         return crate::arsc::ResourceTable::default();
-    };
-    let mut table = crate::arsc::ResourceTable::default();
+    };    let mut table = crate::arsc::ResourceTable::default();
     for name in [
         b"resources.arsc".as_slice(),
         b"base/resources.arsc".as_slice(),
@@ -839,9 +859,23 @@ fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
     let data = match method {
         0 => comp.to_vec(),
         8 => {
-            let mut decoder = DeflateDecoder::new(comp);
+            // Deflate never expands more than 1032 times its input, so a larger
+            // declared size is a lie and the ratio bound is used instead. The
+            // hard ceiling keeps a crafted entry from allocating without bound.
+            let ratio_bound = (comp.len() as u64).saturating_mul(1032);
+            let declared = if uncompressed_size == 0 {
+                ratio_bound
+            } else {
+                uncompressed_size
+            };
+            let limit = declared.min(MAX_INFLATED_BYTES);
             let mut out = Vec::new();
-            decoder.read_to_end(&mut out)?;
+            DeflateDecoder::new(comp)
+                .take(limit + 1)
+                .read_to_end(&mut out)?;
+            if out.len() as u64 > limit {
+                bail!("zip entry {name} inflates past {limit} bytes");
+            }
             out
         }
         other => bail!("unsupported compression method: {other}"),
@@ -917,18 +951,27 @@ fn parse_cd_dex_entries(apk: &[u8]) -> Result<Vec<DexEntry>> {
     let (cd_off, cd_end) = cd_bounds(apk)?;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    for (index, entry) in walk_central_directory(apk, cd_off, cd_end)?
-        .iter()
-        .enumerate()
-    {
-        if let Some(dex) = root_dex(entry, index as u32) {
-            if seen.insert(dex.name.clone()) {
-                entries.push(dex);
+    let walked = walk_central_directory(apk, cd_off, cd_end);
+    if let Ok(records) = &walked {
+        for (index, entry) in records.iter().enumerate() {
+            if let Some(dex) = root_dex(entry, index as u32) {
+                if seen.insert(dex.name.clone()) {
+                    entries.push(dex);
+                }
             }
         }
     }
+    // A directory record the walk could not reach still leaves the DEX bytes in
+    // the archive, and the scan below finds them by name.
     append_classes_heuristic(apk, cd_off, cd_end, &mut entries, &mut seen)?;
-    Ok(entries)
+    match walked {
+        Ok(_) => Ok(entries),
+        Err(err) if entries.is_empty() => Err(err),
+        Err(err) => {
+            eprintln!("warning: {err}");
+            Ok(entries)
+        }
+    }
 }
 
 fn root_dex(entry: &ZipEntry, cd_index: u32) -> Option<DexEntry> {
@@ -978,7 +1021,9 @@ fn append_classes_heuristic(
         if header < cd_off {
             continue;
         }
-        let Ok(Some((Some(entry), _))) = read_cd_record(apk, header, cd_end) else {
+        // Most probes land on bytes that are not a record at all; the ones that
+        // fail to parse are simply not a candidate.
+        let Ok((Some(entry), _)) = read_cd_record(apk, header, cd_end) else {
             continue;
         };
         if let Some(dex) = root_dex(&entry, u32::MAX) {
@@ -1035,27 +1080,33 @@ fn walk_central_directory(apk: &[u8], cd_off: usize, cd_end: usize) -> Result<Ve
     let mut entries = Vec::new();
     let mut ptr = cd_off;
     while ptr + 46 <= cd_end {
-        let Some((maybe, next)) = read_cd_record(apk, ptr, cd_end)? else {
-            break;
-        };
+        let (maybe, next) = read_cd_record(apk, ptr, cd_end)?;
         if let Some(entry) = maybe {
             entries.push(entry);
         }
         if next <= ptr {
-            break;
+            bail!("central directory record at {ptr:#x} does not advance");
         }
         ptr = next;
     }
     Ok(entries)
 }
 
+/// Reads one central directory record.
+///
+/// A record that cannot be trusted is an error rather than a stop condition:
+/// stopping quietly would drop every entry after it, which reads as "the
+/// archive has no such file" instead of "the directory is damaged".
 fn read_cd_record(
     apk: &[u8],
     header: usize,
     cd_end: usize,
-) -> Result<Option<(Option<ZipEntry>, usize)>> {
-    if header + 46 > cd_end || apk.get(header..header + 4) != Some(b"PK\x01\x02") {
-        return Ok(None);
+) -> Result<(Option<ZipEntry>, usize)> {
+    if header + 46 > cd_end {
+        bail!("central directory record at {header:#x} runs past the directory");
+    }
+    if apk.get(header..header + 4) != Some(b"PK\x01\x02") {
+        bail!("central directory record at {header:#x} has a bad signature");
     }
     let method = bytes::u16_at(apk, header + 10)?;
     let crc = bytes::u32_at(apk, header + 16)?;
@@ -1071,7 +1122,7 @@ fn read_cd_record(
     let extra_end = extra_start + extra_len;
     let next = extra_end + comment_len;
     if next > cd_end || next > apk.len() {
-        return Ok(None);
+        bail!("central directory record at {header:#x} runs past the archive");
     }
     let (uncomp_size, comp_size, local_off, disk) = zip64_resolve(
         &apk[extra_start..extra_end],
@@ -1081,9 +1132,10 @@ fn read_cd_record(
         disk,
     )?;
     if disk != 0 {
-        return Ok(Some((None, next)));
+        // Multi disk archives are not supported; keep walking past the entry.
+        return Ok((None, next));
     }
-    Ok(Some((
+    Ok((
         Some(ZipEntry {
             name: apk[name_start..name_start + name_len].to_vec(),
             crc,
@@ -1093,7 +1145,7 @@ fn read_cd_record(
             local_header_off: local_off,
         }),
         next,
-    )))
+    ))
 }
 
 fn zip64_resolve(
@@ -1211,15 +1263,37 @@ fn manifest_rank(name: &[u8], wanted: &[u8]) -> Option<u8> {
     }
 }
 
+/// Finds the end of central directory record.
+///
+/// The archive comment may hold any bytes, including this signature, so a
+/// candidate is only trusted when its declared comment length reaches the end
+/// of the file. A candidate that merely fits is kept as a fallback for archives
+/// with trailing bytes after the record.
 fn find_eocd(apk: &[u8]) -> Option<usize> {
     if apk.len() < 22 {
         return None;
     }
     let search_start = apk.len().saturating_sub(65536 + 22);
     let tail = &apk[search_start..];
-    tail.windows(4)
-        .rposition(|window| window == b"PK\x05\x06")
-        .map(|rel| search_start + rel)
+    let mut fallback = None;
+    for rel in (0..tail.len().saturating_sub(3)).rev() {
+        if &tail[rel..rel + 4] != b"PK\x05\x06" {
+            continue;
+        }
+        let at = search_start + rel;
+        if at + 22 > apk.len() {
+            continue;
+        }
+        let comment_len = u16::from_le_bytes([apk[at + 20], apk[at + 21]]) as usize;
+        let end = at + 22 + comment_len;
+        if end == apk.len() {
+            return Some(at);
+        }
+        if end < apk.len() && fallback.is_none() {
+            fallback = Some(at);
+        }
+    }
+    fallback
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1230,7 +1304,27 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{inflate_bytes, zip64_cd_bounds, ZipBytes};
+    use std::io::Write;
+
+    use super::{
+        cd_bounds, find_eocd, inflate_bytes, parse_cd_dex_entries, walk_central_directory,
+        zip64_cd_bounds, ZipBytes,
+    };
+
+    /// An end of central directory record with the given archive comment.
+    ///
+    /// The record is `PK\x05\x06`, four `u16` disk/entry fields, the central
+    /// directory size and offset, then the comment length.
+    fn eocd_with_comment(comment: &[u8]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        archive.extend_from_slice(b"PK\x05\x06");
+        archive.extend_from_slice(&[0u8; 8]); // disk, entries on disk, entries total
+        archive.extend_from_slice(&0u32.to_le_bytes()); // central directory size
+        archive.extend_from_slice(&0u32.to_le_bytes()); // central directory offset
+        archive.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+        archive.extend_from_slice(comment);
+        archive
+    }
 
     #[test]
     fn a_wild_zip64_local_offset_is_an_error_not_an_overflow() {
@@ -1255,5 +1349,69 @@ mod tests {
         data[20..24].copy_from_slice(b"PK\x05\x06");
         let err = zip64_cd_bounds(&data, 20).unwrap_err();
         assert!(err.to_string().contains("ZIP64 EOCD offset"), "{err}");
+    }
+
+    #[test]
+    fn distinct_descriptors_never_share_an_output_path() {
+        use super::class_output_path;
+        use std::path::Path;
+        // `La.b;` and `La_b;` sanitize to the same stem without the hash.
+        let left = class_output_path(Path::new("out"), "La.b;", "java");
+        let right = class_output_path(Path::new("out"), "La_b;", "java");
+        assert_ne!(left, right, "{left:?} {right:?}");
+        // A descriptor that needs no change keeps its plain name.
+        assert_eq!(
+            class_output_path(Path::new("out"), "Lcom/example/Foo$Bar;", "java"),
+            Path::new("out/com/example/Foo$Bar.java")
+        );
+    }
+
+    #[test]
+    fn a_comment_holding_the_eocd_signature_does_not_shadow_the_record() {
+        let comment = b"see PK\x05\x06 inside";
+        let archive = eocd_with_comment(comment);
+        assert_eq!(find_eocd(&archive), Some(0), "comment={comment:?}");
+    }
+
+    #[test]
+    fn a_damaged_central_directory_record_is_an_error() {
+        let mut archive = vec![0u8; 46];
+        archive[0..4].copy_from_slice(b"XXXX");
+        archive.extend_from_slice(b"PK\x05\x06");
+        archive.extend_from_slice(&[0u8; 8]);
+        archive.extend_from_slice(&46u32.to_le_bytes()); // central directory size
+        archive.extend_from_slice(&0u32.to_le_bytes()); // central directory offset
+        archive.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        let (start, end) = cd_bounds(&archive).unwrap();
+        assert_eq!((start, end), (0, 46));
+        let Err(err) = walk_central_directory(&archive, start, end) else {
+            panic!("a damaged record must be reported");
+        };
+        assert!(err.to_string().contains("bad signature"), "{err}");
+        assert!(parse_cd_dex_entries(&archive).is_err());
+    }
+
+    #[test]
+    fn a_lying_uncompressed_size_bounds_the_inflation() {
+        let payload = vec![0u8; 1 << 20];
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // A local file header, then the stream. The record claims 16 bytes.
+        let mut archive = vec![0u8; 30];
+        archive[0..4].copy_from_slice(b"PK\x03\x04");
+        archive.extend_from_slice(&compressed);
+        let entry = ZipBytes {
+            name: "classes.dex",
+            method: 8,
+            crc: 0,
+            compressed_size: compressed.len() as u64,
+            uncompressed_size: 16,
+            header_offset: 0,
+        };
+        let err = inflate_bytes(&archive, entry).unwrap_err();
+        assert!(err.to_string().contains("inflates past"), "{err}");
     }
 }
