@@ -4,6 +4,10 @@
 use crate::bytes::{decode_mutf8, read_uleb, read_until_nul, u16_at, u32_at, uleb_len};
 use crate::Result;
 
+/// Bounds `encoded_value` recursion. Real annotations and static values nest a
+/// handful of levels; anything deeper is crafted and would overflow the stack.
+const MAX_ENCODED_DEPTH: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct Header {
     pub string_ids_off: u32,
@@ -351,25 +355,28 @@ impl<'a> Dex<'a> {
         if off == 0 {
             return Ok(Vec::new());
         }
-        let (values, _) = self.encoded_array(off as usize)?;
+        let (values, _) = self.encoded_array(off as usize, 0)?;
         Ok(values)
     }
 
-    fn encoded_array(&self, mut pos: usize) -> Result<(Vec<String>, usize)> {
+    fn encoded_array(&self, mut pos: usize, depth: usize) -> Result<(Vec<String>, usize)> {
+        if depth > MAX_ENCODED_DEPTH {
+            bail!("encoded value nesting is too deep");
+        }
         let start = pos;
         let (size, n) = read_uleb(self.data, pos)?;
         pos += n;
         let count = bounded_count(size, self.data.len().saturating_sub(pos), 1)?;
         let mut values = Vec::with_capacity(count);
         for _ in 0..size {
-            let (value, n) = self.encoded_value(pos)?;
+            let (value, n) = self.encoded_value(pos, depth)?;
             pos += n;
             values.push(value);
         }
         Ok((values, pos - start))
     }
 
-    fn encoded_value(&self, pos: usize) -> Result<(String, usize)> {
+    fn encoded_value(&self, pos: usize, depth: usize) -> Result<(String, usize)> {
         let header = *self
             .data
             .get(pos)
@@ -449,11 +456,11 @@ impl<'a> Dex<'a> {
                 1,
             )),
             0x1c => {
-                let (values, n) = self.encoded_array(body)?;
+                let (values, n) = self.encoded_array(body, depth + 1)?;
                 Ok((format!("{{{}}}", values.join(", ")), 1 + n))
             }
             0x1d => {
-                let (text, n) = self.encoded_annotation(body)?;
+                let (text, n) = self.encoded_annotation(body, depth + 1)?;
                 Ok((text, 1 + n))
             }
             _ => {
@@ -463,7 +470,10 @@ impl<'a> Dex<'a> {
         }
     }
 
-    fn encoded_annotation(&self, mut pos: usize) -> Result<(String, usize)> {
+    fn encoded_annotation(&self, mut pos: usize, depth: usize) -> Result<(String, usize)> {
+        if depth > MAX_ENCODED_DEPTH {
+            bail!("encoded value nesting is too deep");
+        }
         let start = pos;
         let (type_idx, n) = read_uleb(self.data, pos)?;
         pos += n;
@@ -473,7 +483,7 @@ impl<'a> Dex<'a> {
         for _ in 0..size {
             let (name_idx, n) = read_uleb(self.data, pos)?;
             pos += n;
-            let (value, n) = self.encoded_value(pos)?;
+            let (value, n) = self.encoded_value(pos, depth)?;
             pos += n;
             parts.push(format!("{}={value}", self.string(name_idx)?));
         }
@@ -707,5 +717,33 @@ mod tests {
         let dex = Dex::parse(&data).unwrap();
         let err = dex.static_literals(0x70).unwrap_err();
         assert!(err.to_string().contains("count"), "{err}");
+    }
+
+    /// `[size=1, VALUE_ARRAY]` repeated, then a `VALUE_NULL` leaf.
+    fn nested_encoded_array(levels: usize) -> (Vec<u8>, u32) {
+        let mut data = vec![0u8; 0x70];
+        data[..8].copy_from_slice(b"dex\n035\0");
+        let start = data.len() as u32;
+        for _ in 0..levels {
+            data.extend_from_slice(&[0x01, 0x1c]);
+        }
+        data.extend_from_slice(&[0x01, 0x1e]);
+        (data, start)
+    }
+
+    #[test]
+    fn deep_encoded_values_stop_instead_of_overflowing_the_stack() {
+        let (data, start) = nested_encoded_array(4096);
+        let dex = Dex::parse(&data).unwrap();
+        let err = dex.static_literals(start).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "{err}");
+    }
+
+    #[test]
+    fn a_shallow_encoded_array_still_decodes() {
+        let (data, start) = nested_encoded_array(3);
+        let dex = Dex::parse(&data).unwrap();
+        let values = dex.static_literals(start).unwrap();
+        assert_eq!(values, vec!["{{{null}}}".to_string()]);
     }
 }

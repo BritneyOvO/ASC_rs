@@ -662,6 +662,56 @@ pub fn make_payload_dex(kind: u8) -> Vec<u8> {
     )
 }
 
+/// A method whose switch payload sits after the code that branches to it, so a
+/// case target is only right when its offset is resolved against the switch
+/// instruction rather than against the payload.
+pub fn make_switch_dex(packed: bool) -> Vec<u8> {
+    let opcode = if packed { 0x2b } else { 0x2c };
+    let ident: u16 = if packed { 0x0100 } else { 0x0200 };
+    // pc 0: const/4 v0, 0
+    // pc 1: packed/sparse-switch v0, +5 (3 units) -> payload at pc 6
+    // pc 4: return-void
+    // pc 5: nop
+    let mut insns = vec![
+        0x12, 0x00, opcode, 0x00, 0x05, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00,
+    ];
+    // pc 6: one case, target = switch pc (1) + 3 = 4.
+    insns.extend_from_slice(&ident.to_le_bytes());
+    insns.extend_from_slice(&1u16.to_le_bytes());
+    insns.extend_from_slice(&0i32.to_le_bytes());
+    insns.extend_from_slice(&3i32.to_le_bytes());
+    one_method_dex(
+        &[
+            b"Lexample/Test;",
+            b"Ljava/lang/Object;",
+            b"V",
+            b"token",
+            b"after",
+        ],
+        4,
+        &insns,
+    )
+}
+
+/// A `fill-array-data` payload that claims `width` bytes per element.
+pub fn make_array_data_dex(width: u16, count: u32) -> Vec<u8> {
+    let mut insns = vec![0x26, 0x00, 0x03, 0x00, 0x00, 0x00];
+    insns.extend_from_slice(&0x0300u16.to_le_bytes());
+    insns.extend_from_slice(&width.to_le_bytes());
+    insns.extend_from_slice(&count.to_le_bytes());
+    one_method_dex(
+        &[
+            b"Lexample/Test;",
+            b"Ljava/lang/Object;",
+            b"V",
+            b"token",
+            b"after",
+        ],
+        4,
+        &insns,
+    )
+}
+
 pub fn make_reordered_string_dex() -> Vec<u8> {
     let strings: [&[u8]; 5] = [
         b"Lexample/Test;",

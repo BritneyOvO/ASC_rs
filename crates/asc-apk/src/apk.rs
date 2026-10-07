@@ -815,8 +815,12 @@ fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
     } = entry;
     let off = usize::try_from(header_offset)
         .map_err(|_| Error::new(format!("zip offset for {name} exceeds this platform")))?;
+    // A crafted ZIP64 offset must not wrap the addition before it is checked.
+    let sig_end = off
+        .checked_add(4)
+        .ok_or_else(|| Error::new(format!("zip offset for {name} exceeds this platform")))?;
     let sig = apk
-        .get(off..off + 4)
+        .get(off..sig_end)
         .ok_or_else(|| Error::new("bad local header signature"))?;
     if sig != b"PK\x03\x04" {
         bail!("bad local header signature");
@@ -1015,7 +1019,11 @@ fn zip64_cd_bounds(apk: &[u8], eocd: usize) -> Result<(u64, u64)> {
     let loc = eocd - 20;
     let eocd64 = bytes::u64_at(apk, loc + 8)?;
     let at = usize::try_from(eocd64).map_err(|_| Error::new("ZIP64 EOCD offset is too large"))?;
-    if apk.get(at..at + 4) != Some(b"PK\x06\x06") || at + 56 > apk.len() {
+    // Bound the record before any relative read, so a wild offset cannot wrap.
+    let end = at
+        .checked_add(56)
+        .ok_or_else(|| Error::new("ZIP64 EOCD offset is too large"))?;
+    if end > apk.len() || apk.get(at..at + 4) != Some(b"PK\x06\x06") {
         bail!("ZIP64 EOCD not found");
     }
     let cd_size = bytes::u64_at(apk, at + 40)?;
@@ -1218,4 +1226,34 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inflate_bytes, zip64_cd_bounds, ZipBytes};
+
+    #[test]
+    fn a_wild_zip64_local_offset_is_an_error_not_an_overflow() {
+        let data = vec![0u8; 64];
+        let entry = ZipBytes {
+            name: "classes.dex",
+            method: 0,
+            crc: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            header_offset: u64::MAX,
+        };
+        let err = inflate_bytes(&data, entry).unwrap_err();
+        assert!(err.to_string().contains("exceeds this platform"), "{err}");
+    }
+
+    #[test]
+    fn a_wild_zip64_eocd_offset_is_an_error_not_an_overflow() {
+        let mut data = vec![0u8; 42];
+        data[0..4].copy_from_slice(b"PK\x06\x07");
+        data[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[20..24].copy_from_slice(b"PK\x05\x06");
+        let err = zip64_cd_bounds(&data, 20).unwrap_err();
+        assert!(err.to_string().contains("ZIP64 EOCD offset"), "{err}");
+    }
 }

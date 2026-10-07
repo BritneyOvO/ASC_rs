@@ -192,10 +192,15 @@ fn find_string_refs(
     let inflated = inflated?;
     run_indexed(inflated.len(), options.threads, |index| {
         let (name, bytes) = &inflated[index];
-        find_strings_resolved(bytes, name, pattern, &|raw| {
-            resolve_literal(&resources, raw)
-        })
-        .map_err(Error::from)
+        match find_strings_resolved(bytes, name, pattern, &|raw| resolve_literal(&resources, raw)) {
+            Ok(lines) => Ok(lines),
+            // One unsearchable member must not hide the hits from the rest.
+            Err(asc_abc::Error::Unsupported(message)) => {
+                eprintln!("warning: {name}: {message}");
+                Ok(Vec::new())
+            }
+            Err(err) => Err(Error::from(err)),
+        }
     })
 }
 
@@ -484,7 +489,11 @@ fn inflate_bytes(hap: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
     } = entry;
     let off = usize::try_from(header_offset)
         .map_err(|_| Error::new(format!("zip offset for {name} exceeds this platform")))?;
-    if hap.get(off..off + 4) != Some(b"PK\x03\x04") {
+    // A crafted ZIP64 offset must not wrap the addition before it is checked.
+    let sig_end = off
+        .checked_add(4)
+        .ok_or_else(|| Error::new(format!("zip offset for {name} exceeds this platform")))?;
+    if hap.get(off..sig_end) != Some(b"PK\x03\x04") {
         bail!("bad local header signature");
     }
     let name_len = u16_at(hap, off + 26)? as usize;
@@ -574,7 +583,11 @@ fn zip64_cd_bounds(data: &[u8], eocd: usize) -> Result<(u64, u64)> {
     let loc = eocd - 20;
     let eocd64 = u64_at(data, loc + 8)?;
     let at = usize::try_from(eocd64).map_err(|_| Error::new("ZIP64 EOCD offset is too large"))?;
-    if data.get(at..at + 4) != Some(b"PK\x06\x06") || at + 56 > data.len() {
+    // Bound the record before any relative read, so a wild offset cannot wrap.
+    let end = at
+        .checked_add(56)
+        .ok_or_else(|| Error::new("ZIP64 EOCD offset is too large"))?;
+    if end > data.len() || data.get(at..at + 4) != Some(b"PK\x06\x06") {
         bail!("ZIP64 EOCD not found");
     }
     Ok((u64_at(data, at + 48)?, u64_at(data, at + 40)?))
@@ -976,5 +989,32 @@ mod tests {
         let dumped = std::fs::read_to_string(out.join("demo/App.ets")).unwrap();
         assert!(dumped.contains("public i32 Hello;"), "{dumped}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wild_zip64_local_offset_is_an_error_not_an_overflow() {
+        use super::{inflate_bytes, ZipBytes};
+        let data = vec![0u8; 64];
+        let entry = ZipBytes {
+            name: "ets/modules.abc",
+            method: 0,
+            crc: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            header_offset: u64::MAX,
+        };
+        let err = inflate_bytes(&data, entry).unwrap_err();
+        assert!(err.to_string().contains("exceeds this platform"), "{err}");
+    }
+
+    #[test]
+    fn a_wild_zip64_eocd_offset_is_an_error_not_an_overflow() {
+        use super::zip64_cd_bounds;
+        let mut data = vec![0u8; 42];
+        data[0..4].copy_from_slice(b"PK\x06\x07");
+        data[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[20..24].copy_from_slice(b"PK\x05\x06");
+        let err = zip64_cd_bounds(&data, 20).unwrap_err();
+        assert!(err.to_string().contains("ZIP64 EOCD offset"), "{err}");
     }
 }

@@ -568,6 +568,20 @@ fn parse_pool(chunk: &[u8]) -> Result<Vec<String>> {
     let count = u32_at(chunk, 8)? as usize;
     let flags = u32_at(chunk, 16)?;
     let strings_start = u32_at(chunk, 20)? as usize;
+    if header_size < 28 || header_size > chunk.len() || strings_start > chunk.len() {
+        bail!("truncated resource string pool");
+    }
+    // The offset table has to fit before the count can size an allocation.
+    let index_bytes = count
+        .checked_mul(4)
+        .ok_or_else(|| crate::Error::new("resource string pool is too large"))?;
+    if header_size
+        .checked_add(index_bytes)
+        .map(|end| end > chunk.len())
+        .unwrap_or(true)
+    {
+        bail!("truncated resource string pool");
+    }
     let utf8 = flags & (1 << 8) != 0;
     let mut strings = Vec::with_capacity(count);
     for index in 0..count {
@@ -619,6 +633,10 @@ fn read_utf16(data: &[u8], off: usize) -> Result<String> {
         (usize::from(first), 2)
     };
     let start = off + skip;
+    // The length prefix must not size an allocation the buffer cannot back.
+    if chars > data.len().saturating_sub(start) / 2 {
+        bail!("truncated resource string");
+    }
     let mut units = Vec::with_capacity(chars);
     for index in 0..chars {
         units.push(u16_at(data, start + index * 2)?);
@@ -883,5 +901,53 @@ mod tests {
         let empty = ResourceTable::default();
         let untouched = "v0 = 2130771968;\n    sget v1, Lcom/example/R$string;->app_name\n";
         assert_eq!(empty.rewrite_code(untouched), untouched);
+    }
+
+    /// A resource table whose only chunk is a global string pool. `body` holds
+    /// the offset table and string data after the 28 byte pool header.
+    fn arsc_with_pool(count: u32, body: &[u8], utf8: bool) -> Vec<u8> {
+        let header_size = 28usize;
+        let mut pool = vec![0u8; header_size];
+        put_u16(&mut pool, 0, 0x0001);
+        put_u16(&mut pool, 2, header_size as u16);
+        put_u32(&mut pool, 8, count);
+        put_u32(&mut pool, 16, if utf8 { 1 << 8 } else { 0 });
+        // One offset entry, so tests that read a string can point it at zero.
+        put_u32(&mut pool, 20, (header_size + 4) as u32);
+        pool.extend_from_slice(body);
+        let len = pool.len() as u32;
+        put_u32(&mut pool, 4, len);
+
+        let mut table = vec![0u8; 12];
+        put_u16(&mut table, 0, 0x0002);
+        put_u16(&mut table, 2, 12);
+        put_u32(&mut table, 8, 1);
+        table.extend(pool);
+        let len = table.len() as u32;
+        put_u32(&mut table, 4, len);
+        table
+    }
+
+    #[test]
+    fn a_pool_with_no_room_for_its_offsets_is_rejected() {
+        // The count alone used to size the allocation before any read.
+        let table = arsc_with_pool(u32::MAX, &[], true);
+        let Err(err) = ResourceTable::parse(&table) else {
+            panic!("a pool with no room for its offsets must be rejected");
+        };
+        assert!(err.to_string().contains("string pool"), "{err}");
+    }
+
+    #[test]
+    fn a_utf16_length_is_bound_to_the_buffer() {
+        // The length prefix claims 2 GiB of UTF-16 units in a 36 byte file.
+        let mut body = vec![0u8; 4];
+        put_u32(&mut body, 0, 0);
+        body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        let table = arsc_with_pool(1, &body, false);
+        let Err(err) = ResourceTable::parse(&table) else {
+            panic!("a length the buffer cannot back must be rejected");
+        };
+        assert!(err.to_string().contains("resource string"), "{err}");
     }
 }

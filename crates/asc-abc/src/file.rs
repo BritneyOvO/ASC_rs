@@ -1,7 +1,8 @@
 //! Panda ABC reader. Class-index offsets stay in the file; names are decoded per query.
 //!
-//! The class index is sorted by UTF-16 length, then by MUTF-8 bytes. A name lookup
-//! uses that order so it can binary-search without building a side table.
+//! The class index is sorted by MUTF-8 bytes, which for UTF-8 preserves code
+//! point order. A name lookup binary-searches that order without building a
+//! side table.
 
 use regex::bytes::RegexBuilder;
 
@@ -9,11 +10,16 @@ use crate::Result;
 
 const HEADER_SIZE: usize = 60;
 const REGION_SIZE: usize = 40;
+/// Last ABC version that keeps the literal array index in the file header. From
+/// the next version on, literal arrays have to be discovered by scanning method
+/// instructions (`CollectUtil::CollectLiteralArray` upstream).
+const LAST_HEADER_LITERAL_VERSION: [u8; 4] = [12, 0, 6, 0];
 
 type LiteralResolve<'a> = dyn Fn(&[u8]) -> Option<String> + 'a;
 
 #[derive(Clone, Debug)]
 struct Header {
+    version: [u8; 4],
     foreign_off: u32,
     foreign_size: u32,
     num_classes: u32,
@@ -30,7 +36,6 @@ pub struct Abc<'a> {
 }
 
 struct Name<'a> {
-    utf16_len: u32,
     bytes: &'a [u8],
     encoded_len: usize,
 }
@@ -48,6 +53,7 @@ impl<'a> Abc<'a> {
             bail!("invalid ABC header");
         }
         let header = Header {
+            version: [data[12], data[13], data[14], data[15]],
             foreign_off: u32_at(data, 20)?,
             foreign_size: u32_at(data, 24)?,
             num_classes: u32_at(data, 28)?,
@@ -207,18 +213,13 @@ impl<'a> Abc<'a> {
         if self.header.num_classes == 0 {
             return Ok(None);
         }
-        let query_len = u32::try_from(query.encode_utf16().count()).unwrap_or(u32::MAX);
         let query_bytes = query.as_bytes();
         let mut left: i64 = 0;
         let mut right = self.header.num_classes as i64 - 1;
         while left <= right {
             let mid = ((left + right) >> 1) as u32;
             let name = self.class_name(mid)?;
-            let order = name
-                .utf16_len
-                .cmp(&query_len)
-                .then_with(|| name.bytes.cmp(query_bytes));
-            match order {
+            match name.bytes.cmp(query_bytes) {
                 std::cmp::Ordering::Equal => return Ok(Some(self.class_off(mid)?)),
                 std::cmp::Ordering::Less => left = mid as i64 + 1,
                 std::cmp::Ordering::Greater => right = mid as i64 - 1,
@@ -305,18 +306,13 @@ impl<'a> Abc<'a> {
         let name_off = u32_at(self.data, pos + 4)? as usize;
         let mut next = pos + 8;
         let access = read_uleb(self.data, &mut next)?;
-        next = skip_tags(self.data, next, TagKind::Method)?;
-        let region = self.region_covering(pos)?;
-        let proto_off = region_slot(
-            self.data,
-            region.proto_idx_off,
-            region.proto_idx_size,
-            proto_idx,
-            "proto",
-        )?;
-        let proto_region = self.region_covering(proto_off as usize)?;
-        let (ret, params) = self.proto_types(proto_off as usize, &proto_region)?;
+        let (tags_end, code_off) = method_tags(self.data, next)?;
+        next = tags_end;
         let name = self.string_at(name_off)?;
+        let (ret, params) = match self.resolved_proto(pos, proto_idx)? {
+            Some(types) => types,
+            None => generic_proto(self.code_args(code_off), access),
+        };
         let _ = class_idx;
         Ok((
             format!(
@@ -327,6 +323,52 @@ impl<'a> Abc<'a> {
             ),
             next,
         ))
+    }
+
+    /// The proto a method records, or `None` when the file records none.
+    ///
+    /// Ark ES classes store `INVALID_INDEX` and keep no proto table at all, so
+    /// there is no signature to read and the caller falls back to the code item.
+    fn resolved_proto(
+        &self,
+        method_pos: usize,
+        proto_idx: u16,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        if proto_idx == u16::MAX {
+            return Ok(None);
+        }
+        let region = self.region_covering(method_pos)?;
+        if region.proto_idx_off == u32::MAX || region.proto_idx_size == u32::MAX {
+            return Ok(None);
+        }
+        let proto_off = region_slot(
+            self.data,
+            region.proto_idx_off,
+            region.proto_idx_size,
+            proto_idx,
+            "proto",
+        )?;
+        let proto_region = self.region_covering(proto_off as usize)?;
+        Ok(Some(self.proto_types(proto_off as usize, &proto_region)?))
+    }
+
+    /// Argument count from a method's code item, which starts with `num_vregs`,
+    /// `num_args`, and `code_size` as ULEB128.
+    fn code_args(&self, code_off: Option<u32>) -> u32 {
+        // `num_args` is read from the file; a real method never has this many.
+        const MAX_ARGS: u32 = 255;
+        let Some(code_off) = code_off else {
+            return 0;
+        };
+        let Ok((_num_vregs, len)) = read_uleb_at(self.data, code_off as usize) else {
+            return 0;
+        };
+        // `read_uleb_at` reports the encoded length, not the next position.
+        let mut pos = code_off as usize + len;
+        let Ok(num_args) = read_uleb(self.data, &mut pos) else {
+            return 0;
+        };
+        num_args.min(MAX_ARGS)
     }
 
     fn field_type(&self, region: &Region, index: u16) -> Result<String> {
@@ -437,15 +479,24 @@ impl<'a> Abc<'a> {
     }
 
     fn literal_count(&self) -> Result<u32> {
+        let version = self.header.version;
+        if version > LAST_HEADER_LITERAL_VERSION {
+            return Err(crate::Error::Unsupported(format!(
+                "ABC version {}.{}.{}.{} stores no literal array index in the header, and the \
+                 instruction scan that finds literal arrays is not implemented",
+                version[0], version[1], version[2], version[3]
+            )));
+        }
         let count = self.header.num_literalarrays;
-        let off = self.header.literalarray_idx_off;
-        if count == 0 || count == u32::MAX || off == 0 || off == u32::MAX {
+        if count == 0 {
             return Ok(0);
         }
-        match check_index(self.data, off, count, "literal array index") {
-            Ok(()) => Ok(count),
-            Err(_) => Ok(0),
+        let off = self.header.literalarray_idx_off;
+        if off == 0 || off == u32::MAX {
+            bail!("ABC header has {count} literal arrays but no literal array index");
         }
+        check_index(self.data, off, count, "literal array index")?;
+        Ok(count)
     }
 
     fn literal_array_off(&self, index: u32) -> Result<u32> {
@@ -456,11 +507,10 @@ impl<'a> Abc<'a> {
     }
 
     fn string_at(&self, off: usize) -> Result<Name<'a>> {
-        let (tagged, len) = read_uleb_at(self.data, off)?;
+        let (_tagged, len) = read_uleb_at(self.data, off)?;
         let start = off + len;
         let bytes = read_until_nul(self.data, start)?;
         Ok(Name {
-            utf16_len: tagged >> 1,
             bytes,
             encoded_len: start + bytes.len() + 1 - off,
         })
@@ -560,13 +610,38 @@ fn read_literal_string(data: &[u8], str_off: usize) -> Result<Name<'_>> {
     let start = str_off + len;
     let bytes = read_until_nul(data, start)?;
     Ok(Name {
-        utf16_len: tagged >> 1,
         bytes,
         encoded_len: 0,
     })
 }
 
-fn skip_tags(data: &[u8], mut pos: usize, kind: TagKind) -> Result<usize> {
+/// Walks a method's tags, returning the position past them and the code offset
+/// when the method carries code.
+fn method_tags(data: &[u8], mut pos: usize) -> Result<(usize, Option<u32>)> {
+    let mut code_off = None;
+    loop {
+        let tag = *data
+            .get(pos)
+            .ok_or_else(|| crate::Error::new("truncated ABC tagged value"))?;
+        pos += 1;
+        match tag {
+            0 => return Ok((pos, code_off)),
+            0x01 => {
+                code_off = Some(u32_at(data, pos)?);
+                pos += 4;
+            }
+            0x02 => pos += 1,
+            0x03..=0x09 => pos += 4,
+            _ => bail!("unknown ABC tag {tag:#x}"),
+        }
+    }
+}
+
+fn skip_tags(data: &[u8], pos: usize, kind: TagKind) -> Result<usize> {
+    if matches!(kind, TagKind::Method) {
+        return Ok(method_tags(data, pos)?.0);
+    }
+    let mut pos = pos;
     loop {
         let tag = *data
             .get(pos)
@@ -580,21 +655,38 @@ fn skip_tags(data: &[u8], mut pos: usize, kind: TagKind) -> Result<usize> {
                 let count = read_uleb(data, &mut pos)? as usize;
                 pos + count * 2
             }
-            (TagKind::Class, 0x02) | (TagKind::Method, 0x02) => pos + 1,
+            (TagKind::Class, 0x02) => pos + 1,
             (TagKind::Field, 0x01) => skip_sleb(data, pos)?,
-            (TagKind::Class, 0x03..=0x07)
-            | (TagKind::Field, 0x02..=0x06)
-            | (TagKind::Method, 0x01 | 0x03..=0x09) => pos + 4,
+            (TagKind::Class, 0x03..=0x07) | (TagKind::Field, 0x02..=0x06) => pos + 4,
             _ => bail!("unknown ABC tag {tag:#x}"),
         };
     }
 }
 
 fn region_slot(data: &[u8], off: u32, size: u32, index: u16, what: &str) -> Result<u32> {
+    // `INVALID_INDEX` means the file does not carry this table at all. Reading
+    // through it would use `u32::MAX` as an offset.
+    if off == u32::MAX || size == u32::MAX {
+        bail!("ABC {what} index is not available in this file");
+    }
     if u32::from(index) >= size {
         bail!("ABC {what} index {index} is out of range");
     }
     u32_at(data, off as usize + usize::from(index) * 4)
+}
+
+/// What Ark prints when a method records no proto: every type is `any`, and the
+/// parameters are numbered up to the code item's argument count. Ark counts
+/// `this` as an argument of an instance method, so it is not a parameter.
+fn generic_proto(num_args: u32, access: u32) -> (String, Vec<String>) {
+    const STATIC: u32 = 0x8;
+    let count = if access & STATIC != 0 {
+        num_args
+    } else {
+        num_args.saturating_sub(1)
+    };
+    let params = (0..count).map(|index| format!("any a{index}")).collect();
+    ("any".to_string(), params)
 }
 
 fn access_prefix(flags: u32) -> String {
@@ -796,7 +888,9 @@ pub fn find_members(
 
 #[cfg(test)]
 mod tests {
-    use super::{class_names, class_text, find_members, find_strings, find_strings_resolved};
+    use super::{
+        class_names, class_text, find_members, find_strings, find_strings_resolved, region_slot,
+    };
 
     fn uleb(mut value: u32) -> Vec<u8> {
         let mut out = Vec::new();
@@ -834,6 +928,13 @@ mod tests {
     }
 
     fn sample_abc() -> Vec<u8> {
+        abc_with_class_descriptors(&["Ldemo/App;"])
+    }
+
+    /// A minimal ABC whose header class index lists `names` in the order given,
+    /// followed by one foreign class. Callers pass the order a real file uses:
+    /// sorted by descriptor bytes.
+    fn abc_with_class_descriptors(names: &[&str]) -> Vec<u8> {
         let mut buf = vec![0u8; 60];
         buf[..8].copy_from_slice(b"PANDA\0\0\0");
         buf[12] = 2;
@@ -846,35 +947,38 @@ mod tests {
         let foreign_off = buf.len() as u32;
         buf.extend(panda_str("Lpanda/Object;"));
         let foreign_size = buf.len() as u32 - foreign_off;
-        let class_off = buf.len() as u32;
-        buf.extend(panda_str("Ldemo/App;"));
-        push_u32(&mut buf, foreign_off);
-        buf.extend(uleb(1));
-        buf.extend(uleb(1));
-        buf.extend(uleb(1));
-        buf.push(0);
-        push_u16(&mut buf, 0);
-        push_u16(&mut buf, 1);
-        push_u32(&mut buf, count_off);
-        buf.extend(uleb(1));
-        buf.push(0);
-        push_u16(&mut buf, 0);
-        push_u16(&mut buf, 0);
-        push_u32(&mut buf, main_off);
-        buf.extend(uleb(0x0009));
-        buf.push(0);
+        let mut class_offs = Vec::new();
+        for name in names {
+            class_offs.push(buf.len() as u32);
+            buf.extend(panda_str(name));
+            push_u32(&mut buf, foreign_off);
+            buf.extend(uleb(1));
+            buf.extend(uleb(1));
+            buf.extend(uleb(1));
+            buf.push(0);
+            push_u16(&mut buf, 0);
+            push_u16(&mut buf, 1);
+            push_u32(&mut buf, count_off);
+            buf.extend(uleb(1));
+            buf.push(0);
+            push_u16(&mut buf, 0);
+            push_u16(&mut buf, 0);
+            push_u32(&mut buf, main_off);
+            buf.extend(uleb(0x0009));
+            buf.push(0);
+        }
         let proto_off = buf.len() as u32;
         push_u16(&mut buf, 0x0001);
-        let class_idx_off = buf.len() as u32;
-        push_u32(&mut buf, class_off);
+        let type_table_off = buf.len() as u32;
+        push_u32(&mut buf, class_offs[0]);
         push_u32(&mut buf, 0x0005);
         let proto_idx_off = buf.len() as u32;
         push_u32(&mut buf, proto_off);
         let region_off = buf.len() as u32;
-        push_u32(&mut buf, class_off);
-        push_u32(&mut buf, class_idx_off);
+        push_u32(&mut buf, class_offs[0]);
+        push_u32(&mut buf, type_table_off);
         push_u32(&mut buf, 2);
-        push_u32(&mut buf, class_idx_off);
+        push_u32(&mut buf, type_table_off);
         push_u32(&mut buf, 0);
         push_u32(&mut buf, 0);
         push_u32(&mut buf, 0);
@@ -882,7 +986,9 @@ mod tests {
         push_u32(&mut buf, 1);
         push_u32(&mut buf, proto_idx_off);
         let class_index_off = buf.len() as u32;
-        push_u32(&mut buf, class_off);
+        for offset in &class_offs {
+            push_u32(&mut buf, *offset);
+        }
         push_u32(&mut buf, foreign_off);
         let array_off = buf.len() as u32;
         push_u32(&mut buf, 2);
@@ -894,13 +1000,91 @@ mod tests {
         put_u32(&mut buf, 16, file_size);
         put_u32(&mut buf, 20, foreign_off);
         put_u32(&mut buf, 24, foreign_size);
-        put_u32(&mut buf, 28, 2);
+        put_u32(&mut buf, 28, names.len() as u32 + 1);
         put_u32(&mut buf, 32, class_index_off);
         put_u32(&mut buf, 44, 1);
         put_u32(&mut buf, 48, literal_idx_off);
         put_u32(&mut buf, 52, 1);
         put_u32(&mut buf, 56, region_off);
         buf
+    }
+
+    /// One class with a single `main` method that records `INVALID_INDEX` as its
+    /// proto, the way Ark ES classes do. `with_code` decides whether the method
+    /// carries a code item, which is where the argument count comes from.
+    fn abc_with_a_protoless_method(with_code: bool) -> Vec<u8> {
+        let mut buf = vec![0u8; 60];
+        buf[..8].copy_from_slice(b"PANDA\0\0\0");
+        buf[12] = 2;
+        let main_off = buf.len() as u32;
+        buf.extend(panda_str("main"));
+        let foreign_off = buf.len() as u32;
+        buf.extend(panda_str("Lpanda/Object;"));
+        let foreign_size = buf.len() as u32 - foreign_off;
+        // Code item: num_vregs=4, num_args=2, code_size=2, two instruction bytes.
+        let code_off = buf.len() as u32;
+        buf.extend(uleb(4));
+        buf.extend(uleb(2));
+        buf.extend(uleb(2));
+        buf.extend_from_slice(&[0x0e, 0x00]);
+        let class_off = buf.len() as u32;
+        buf.extend(panda_str("Ldemo/App;"));
+        push_u32(&mut buf, foreign_off);
+        buf.extend(uleb(1));
+        buf.extend(uleb(0));
+        buf.extend(uleb(1));
+        buf.push(0);
+        push_u16(&mut buf, 0);
+        push_u16(&mut buf, 0xffff);
+        push_u32(&mut buf, main_off);
+        buf.extend(uleb(0x0008));
+        if with_code {
+            buf.push(0x01);
+            push_u32(&mut buf, code_off);
+        }
+        buf.push(0);
+        let type_table_off = buf.len() as u32;
+        push_u32(&mut buf, class_off);
+        push_u32(&mut buf, 0x0005);
+        let region_off = buf.len() as u32;
+        push_u32(&mut buf, class_off);
+        push_u32(&mut buf, type_table_off);
+        push_u32(&mut buf, 2);
+        push_u32(&mut buf, type_table_off);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, 0);
+        push_u32(&mut buf, u32::MAX);
+        push_u32(&mut buf, u32::MAX);
+        let class_index_off = buf.len() as u32;
+        push_u32(&mut buf, class_off);
+        push_u32(&mut buf, foreign_off);
+        let file_size = buf.len() as u32;
+        put_u32(&mut buf, 16, file_size);
+        put_u32(&mut buf, 20, foreign_off);
+        put_u32(&mut buf, 24, foreign_size);
+        put_u32(&mut buf, 28, 2);
+        put_u32(&mut buf, 32, class_index_off);
+        put_u32(&mut buf, 44, 0);
+        put_u32(&mut buf, 48, 0);
+        put_u32(&mut buf, 52, 1);
+        put_u32(&mut buf, 56, region_off);
+        buf
+    }
+
+    #[test]
+    fn a_protoless_method_takes_its_signature_from_its_code() {
+        let data = abc_with_a_protoless_method(true);
+        let text = class_text(&data, "Ldemo/App;").unwrap();
+        assert!(text.contains("static any main(any a0, any a1);"), "{text}");
+    }
+
+    #[test]
+    fn a_protoless_method_without_code_has_no_parameters() {
+        let data = abc_with_a_protoless_method(false);
+        let text = class_text(&data, "Ldemo/App;").unwrap();
+        assert!(text.contains("static any main();"), "{text}");
     }
 
     #[test]
@@ -936,6 +1120,66 @@ mod tests {
         );
         let methods = find_members(&data, "app.abc", true, "main", Some("Ldemo/App;")).unwrap();
         assert_eq!(methods, vec!["app.abc | Ldemo/App;->main".to_string()]);
+    }
+
+    /// A header-only ABC with no classes, so a literal query reaches nothing but
+    /// the header fields under test.
+    fn header_only_abc(version: [u8; 4], literal_count: u32, literal_off: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; super::HEADER_SIZE];
+        buf[..8].copy_from_slice(b"PANDA\0\0\0");
+        buf[12..16].copy_from_slice(&version);
+        put_u32(&mut buf, 16, super::HEADER_SIZE as u32);
+        put_u32(&mut buf, 28, 0);
+        put_u32(&mut buf, 32, 0);
+        put_u32(&mut buf, 44, literal_count);
+        put_u32(&mut buf, 48, literal_off);
+        buf
+    }
+
+    #[test]
+    fn a_newer_abc_reports_that_strings_cannot_be_searched() {
+        // Version 13 keeps no literal array index in the header. Returning an
+        // empty result here would look like "no match" instead of "unsupported".
+        let data = header_only_abc([13, 0, 1, 0], u32::MAX, u32::MAX);
+        assert!(matches!(
+            find_strings(&data, "app.abc", "hello"),
+            Err(crate::Error::Unsupported(_))
+        ));
+        // An older header that really has no literal arrays stays empty.
+        let empty = header_only_abc([12, 0, 2, 0], 0, 0);
+        assert_eq!(
+            find_strings(&empty, "app.abc", "hello").unwrap(),
+            Vec::<String>::new()
+        );
+        // A count with no index is corruption, not "no arrays".
+        let broken = header_only_abc([12, 0, 2, 0], 4, u32::MAX);
+        assert!(find_strings(&broken, "app.abc", "hello").is_err());
+    }
+
+    #[test]
+    fn an_absent_region_index_is_reported_not_read() {
+        let data = vec![0u8; 64];
+        let err = region_slot(&data, u32::MAX, u32::MAX, 0, "proto").unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
+        // A real index still resolves.
+        let mut data = vec![0u8; 64];
+        data[4..8].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(region_slot(&data, 0, 2, 1, "type").unwrap(), 7);
+    }
+
+    #[test]
+    fn class_lookup_follows_the_byte_sorted_index() {
+        // A real class index is sorted by descriptor bytes, which is not the
+        // same as sorting by UTF-16 length first: `L@system.app;` is shorter
+        // than `L@ohos.curves;` yet sorts after it.
+        let data = abc_with_class_descriptors(&["L@ohos.curves;", "L@system.app;"]);
+        for name in ["L@ohos.curves;", "L@system.app;"] {
+            let text = class_text(&data, name).unwrap();
+            assert!(
+                text.contains(&format!("class {name} extends Lpanda/Object;")),
+                "{name}: {text}"
+            );
+        }
     }
 
     /// One entry of a hand-built literal array.

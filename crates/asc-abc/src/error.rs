@@ -7,6 +7,10 @@ pub enum Error {
     Pattern(#[from] regex::Error),
     #[error("{0}")]
     Message(String),
+    /// Data this reader recognizes but cannot answer from yet. Callers that
+    /// search several files can warn and keep the files they can read.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 impl Error {

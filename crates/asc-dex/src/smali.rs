@@ -1,7 +1,7 @@
 //! Baksmali-style printer. One class becomes `.class` / `.field` / `.method`
 //! text. Instructions keep their Dalvik mnemonics and `v`/`p` registers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::bytes::{read_uleb, u16_at, u32_at};
 use crate::dex::{java_quote, ClassDef, CodeItem, Dex, EncodedField, EncodedMethod};
@@ -197,6 +197,7 @@ fn read_tries(dex: &Dex, code_off: u32) -> Result<Vec<Catch>> {
 fn insns(dex: &Dex, code: &CodeItem, catches: &[Catch]) -> Result<String> {
     let bytes = code.insns;
     let mut targets = BTreeSet::new();
+    let mut switch_bases: HashMap<usize, usize> = HashMap::new();
     let mut pc = 0usize;
     while pc * 2 + 1 < bytes.len() {
         let pos = pc * 2;
@@ -210,7 +211,7 @@ fn insns(dex: &Dex, code: &CodeItem, catches: &[Catch]) -> Result<String> {
             break;
         }
         let units = info.len as usize;
-        collect_target(bytes, pos, pc, info.fmt, &mut targets)?;
+        collect_target(bytes, pos, pc, op, info.fmt, &mut targets, &mut switch_bases)?;
         pc += units;
     }
     for catch in catches {
@@ -232,7 +233,8 @@ fn insns(dex: &Dex, code: &CodeItem, catches: &[Catch]) -> Result<String> {
             break;
         }
         if let Some(nbytes) = payload_len(bytes, pos) {
-            out.push_str(&payload(bytes, pos, pc, nbytes)?);
+            let base = switch_bases.get(&pos).copied().unwrap_or(pc);
+            out.push_str(&payload(bytes, pos, base, nbytes)?);
             pc += nbytes / 2;
             continue;
         }
@@ -265,12 +267,19 @@ fn insns(dex: &Dex, code: &CodeItem, catches: &[Catch]) -> Result<String> {
     Ok(out)
 }
 
+/// `packed-switch`, whose payload holds case targets.
+const PACKED_SWITCH: u8 = 0x2b;
+/// `sparse-switch`, whose payload holds case targets.
+const SPARSE_SWITCH: u8 = 0x2c;
+
 fn collect_target(
     bytes: &[u8],
     pos: usize,
     pc: usize,
+    op: u8,
     fmt: Fmt,
     targets: &mut BTreeSet<u32>,
+    switch_bases: &mut HashMap<usize, usize>,
 ) -> Result<()> {
     let add = |offset: i32, targets: &mut BTreeSet<u32>| {
         targets.insert(pc.wrapping_add(offset as usize) as u32);
@@ -282,25 +291,25 @@ fn collect_target(
         Fmt::F30t | Fmt::F31t => add(i32_at(bytes, pos + 2)?, targets),
         _ => {}
     }
-    if fmt == Fmt::F31t {
-        if let Some(nbytes) = payload_at_target(bytes, pc, i32_at(bytes, pos + 2)?) {
-            let payload_pc = pc.wrapping_add(i32_at(bytes, pos + 2)? as usize);
-            mark_payload_targets(bytes, payload_pc * 2, nbytes, payload_pc, targets);
+    if op == PACKED_SWITCH || op == SPARSE_SWITCH {
+        let offset = i32_at(bytes, pos + 2)?;
+        let payload_pc = pc.wrapping_add(offset as usize);
+        let payload_pos = payload_pc.wrapping_mul(2);
+        if let Some(nbytes) = payload_len(bytes, payload_pos) {
+            // Case targets are relative to the address of the switch opcode,
+            // not of the payload, so the payload has to remember its owner.
+            switch_bases.insert(payload_pos, pc);
+            mark_payload_targets(bytes, payload_pos, nbytes, pc, targets);
         }
     }
     Ok(())
-}
-
-fn payload_at_target(bytes: &[u8], pc: usize, offset: i32) -> Option<usize> {
-    let at = pc.wrapping_add(offset as usize) * 2;
-    payload_len(bytes, at)
 }
 
 fn mark_payload_targets(
     bytes: &[u8],
     pos: usize,
     nbytes: usize,
-    pc: usize,
+    base_pc: usize,
     targets: &mut BTreeSet<u32>,
 ) {
     if pos + 4 > bytes.len() {
@@ -320,7 +329,7 @@ fn mark_payload_targets(
                     .try_into()
                     .expect("switch target is 4 bytes"),
             );
-            targets.insert(pc.wrapping_add(rel as usize) as u32);
+            targets.insert(base_pc.wrapping_add(rel as usize) as u32);
         }
     }
 }
@@ -513,7 +522,7 @@ fn format_insn(
     }
 }
 
-fn payload(bytes: &[u8], pos: usize, pc: usize, nbytes: usize) -> Result<String> {
+fn payload(bytes: &[u8], pos: usize, base: usize, nbytes: usize) -> Result<String> {
     let ident = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]);
     let size = u16::from_le_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
     match ident {
@@ -523,7 +532,7 @@ fn payload(bytes: &[u8], pos: usize, pc: usize, nbytes: usize) -> Result<String>
             for index in 0..size {
                 let rel = i32_at(bytes, pos + 8 + index * 4)?;
                 out.push_str("        ");
-                out.push_str(&label(pc.wrapping_add(rel as usize) as u32));
+                out.push_str(&label(base.wrapping_add(rel as usize) as u32));
                 out.push('\n');
             }
             out.push_str(".end packed-switch\n");
@@ -539,7 +548,7 @@ fn payload(bytes: &[u8], pos: usize, pc: usize, nbytes: usize) -> Result<String>
                 out.push_str(&format!(
                     "        {} -> {}\n",
                     hex_i32(key),
-                    label(pc.wrapping_add(rel as usize) as u32)
+                    label(base.wrapping_add(rel as usize) as u32)
                 ));
             }
             out.push_str(".end sparse-switch\n");
@@ -547,6 +556,11 @@ fn payload(bytes: &[u8], pos: usize, pc: usize, nbytes: usize) -> Result<String>
         }
         0x0300 => {
             let width = size;
+            // Dalvik only defines 1, 2, 4, and 8 byte elements. A zero width
+            // would also stop the walk below from advancing.
+            if !matches!(width, 1 | 2 | 4 | 8) {
+                bail!("fill-array-data has an invalid element width {width}");
+            }
             let count =
                 u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap_or([0; 4])) as usize;
             let mut out = format!(".array-data {width}\n");

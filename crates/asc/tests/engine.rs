@@ -316,6 +316,67 @@ fn refs_after_switch_and_fill_array_payloads_are_kept() {
     }
 }
 
+/// Labels a `.packed-switch`/`.sparse-switch` block names but never defines.
+fn undefined_switch_labels(smali: &str) -> Vec<String> {
+    let defined: std::collections::HashSet<&str> = smali
+        .lines()
+        .filter_map(|line| line.strip_prefix(':'))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect();
+    let mut missing = Vec::new();
+    let mut inside = false;
+    for line in smali.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(".packed-switch") || trimmed.starts_with(".sparse-switch") {
+            inside = true;
+            continue;
+        }
+        if trimmed.starts_with(".end packed-switch") || trimmed.starts_with(".end sparse-switch") {
+            inside = false;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        for token in trimmed.split_whitespace() {
+            if let Some(name) = token.strip_prefix(':') {
+                if !defined.contains(name) {
+                    missing.push(name.to_string());
+                }
+            }
+        }
+    }
+    missing
+}
+
+#[test]
+fn switch_case_targets_follow_the_switch_instruction_not_the_payload() {
+    for packed in [true, false] {
+        let dex = support::make_switch_dex(packed);
+        let smali = smali_class(&dex, "Lexample/Test;").unwrap();
+        // The single case jumps back to `return-void` at pc 4. Resolving it
+        // against the payload at pc 6 would print `:l_9` instead.
+        assert!(smali.contains(":l_4"), "packed={packed}: {smali}");
+        assert!(
+            undefined_switch_labels(&smali).is_empty(),
+            "packed={packed}: {:?}\n{smali}",
+            undefined_switch_labels(&smali)
+        );
+    }
+}
+
+#[test]
+fn fill_array_data_rejects_an_impossible_element_width() {
+    for width in [0u16, 3, 9, 4096] {
+        let dex = support::make_array_data_dex(width, 1);
+        let err = smali_class(&dex, "Lexample/Test;").unwrap_err();
+        assert!(
+            err.to_string().contains("element width"),
+            "width={width}: {err}"
+        );
+    }
+}
+
 #[test]
 fn overlapping_buckets_keep_the_method_that_owns_the_instruction() {
     let lines = find_in_dex(

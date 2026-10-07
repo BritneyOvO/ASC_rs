@@ -8,6 +8,11 @@ pub use error::{Error, Result};
 
 use bytes::{u16_at, u32_at};
 
+/// Nesting a real manifest never approaches this. It only exists so that a
+/// crafted one cannot drive the recursive decoder and printer into a stack
+/// overflow, which aborts the process instead of returning an error.
+const MAX_DEPTH: usize = 256;
+
 pub fn manifest_xml(data: &[u8]) -> Result<String> {
     if data.len() >= 8 && u16_at(data, 0)? == 0x0003 {
         return binary_manifest_xml(data);
@@ -51,6 +56,9 @@ fn binary_manifest_xml(data: &[u8]) -> Result<String> {
                 namespaces.pop();
             }
             0x0102 => {
+                if stack.len() >= MAX_DEPTH {
+                    bail!("AndroidManifest.xml is nested too deeply");
+                }
                 let mut node = read_element(chunk, &pool, &namespaces)?;
                 for (prefix, uri) in pending_ns.drain(..) {
                     let key = if prefix.is_empty() {
@@ -316,17 +324,28 @@ fn xml_escape(value: &str) -> String {
 const ANDROID_NS: &str = "http://schemas.android.com/apk/res/android";
 
 fn proto_manifest_xml(data: &[u8]) -> Result<String> {
-    let node = parse_xml_node(data)?;
+    let node = parse_xml_node(data, 0)?;
     let Some(element) = node.element else {
         bail!("AndroidManifest.xml is not a valid protobuf XML");
     };
-    let root = element_to_node(&element, &[]);
+    let root = element_to_node(&element, &[])?;
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     write_node(&mut out, &root, 0);
     Ok(out)
 }
 
-fn element_to_node(element: &ProtoElement, inherited: &[(String, String)]) -> Node {
+fn element_to_node(element: &ProtoElement, inherited: &[(String, String)]) -> Result<Node> {
+    element_to_node_at(element, inherited, 0)
+}
+
+fn element_to_node_at(
+    element: &ProtoElement,
+    inherited: &[(String, String)],
+    depth: usize,
+) -> Result<Node> {
+    if depth >= MAX_DEPTH {
+        bail!("AndroidManifest.xml is nested too deeply");
+    }
     let mut prefixes = inherited.to_vec();
     let mut attrs = Vec::new();
     for (prefix, uri) in &element.namespaces {
@@ -363,10 +382,10 @@ fn element_to_node(element: &ProtoElement, inherited: &[(String, String)]) -> No
             }
         }
         if let Some(inner) = &child.element {
-            node.children.push(element_to_node(inner, &prefixes));
+            node.children.push(element_to_node_at(inner, &prefixes, depth + 1)?);
         }
     }
-    node
+    Ok(node)
 }
 
 fn qualify_name(prefixes: &[(String, String)], namespace_uri: &str, name: &str) -> String {
@@ -410,7 +429,10 @@ struct ProtoAttr {
     compiled: String,
 }
 
-fn parse_xml_node(data: &[u8]) -> Result<ProtoNode> {
+fn parse_xml_node(data: &[u8], depth: usize) -> Result<ProtoNode> {
+    if depth >= MAX_DEPTH {
+        bail!("AndroidManifest.xml is nested too deeply");
+    }
     let mut node = ProtoNode {
         element: None,
         text: None,
@@ -419,7 +441,7 @@ fn parse_xml_node(data: &[u8]) -> Result<ProtoNode> {
     while cursor.remaining() {
         let (field, wire) = cursor.read_key()?;
         match (field, wire) {
-            (1, 2) => node.element = Some(parse_xml_element(cursor.read_bytes()?)?),
+            (1, 2) => node.element = Some(parse_xml_element(cursor.read_bytes()?, depth)?),
             (2, 2) => node.text = Some(cursor.read_string()?),
             (_, wire) => cursor.skip(wire)?,
         }
@@ -427,7 +449,7 @@ fn parse_xml_node(data: &[u8]) -> Result<ProtoNode> {
     Ok(node)
 }
 
-fn parse_xml_element(data: &[u8]) -> Result<ProtoElement> {
+fn parse_xml_element(data: &[u8], depth: usize) -> Result<ProtoElement> {
     let mut element = ProtoElement {
         namespaces: Vec::new(),
         namespace_uri: String::new(),
@@ -447,7 +469,9 @@ fn parse_xml_element(data: &[u8]) -> Result<ProtoElement> {
             (4, 2) => element
                 .attributes
                 .push(parse_attribute(cursor.read_bytes()?)?),
-            (5, 2) => element.children.push(parse_xml_node(cursor.read_bytes()?)?),
+            (5, 2) => element
+                .children
+                .push(parse_xml_node(cursor.read_bytes()?, depth + 1)?),
             (_, wire) => cursor.skip(wire)?,
         }
     }
@@ -748,7 +772,7 @@ fn write_node(out: &mut String, node: &Node, indent: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::manifest_xml;
+    use super::{manifest_xml, MAX_DEPTH};
 
     fn push_u16(buf: &mut Vec<u8>, value: u16) {
         buf.extend_from_slice(&value.to_le_bytes());
@@ -972,5 +996,39 @@ mod tests {
         );
         assert!(xml.contains("android:allowBackup=\"true\""), "{xml}");
         assert!(xml.contains("<application"), "{xml}");
+    }
+
+    #[test]
+    fn deep_binary_nesting_is_rejected() {
+        let strings = ["manifest"];
+        let mut body = encode_pool(&strings);
+        let depth = MAX_DEPTH + 4;
+        for _ in 0..depth {
+            body.extend(element(0xffff_ffff, 0, &[]));
+        }
+        for _ in 0..depth {
+            body.extend(end_element(0xffff_ffff, 0));
+        }
+        let mut file = Vec::new();
+        push_u16(&mut file, 0x0003);
+        push_u16(&mut file, 8);
+        push_u32(&mut file, (8 + body.len()) as u32);
+        file.extend(body);
+        let err = manifest_xml(&file).unwrap_err();
+        assert!(err.to_string().contains("nested too deeply"), "{err}");
+    }
+
+    #[test]
+    fn deep_protobuf_nesting_is_rejected() {
+        let mut element = proto_str(3, "a");
+        for _ in 0..MAX_DEPTH + 4 {
+            let node = proto_bytes(1, &element);
+            let mut parent = proto_str(3, "a");
+            parent.extend(proto_bytes(5, &node));
+            element = parent;
+        }
+        let root = proto_bytes(1, &element);
+        let err = manifest_xml(&root).unwrap_err();
+        assert!(err.to_string().contains("nested too deeply"), "{err}");
     }
 }
