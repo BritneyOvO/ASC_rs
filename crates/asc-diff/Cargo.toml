@@ -1,0 +1,18 @@
+[package]
+name = "asc-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "File-level diff of APK, HAP, and other ZIP archives"
+
+[dependencies]
+flate2.workspace = true
+memmap2.workspace = true
+sha2 = "0.11.0"
+thiserror.workspace = true
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+crc32fast.workspace = true
+rcgen = "0.14.10"

@@ -70,9 +70,17 @@ struct InsnSpan {
     end: usize,
 }
 
+const NO_METHOD: u32 = u32::MAX;
+/// Methods that share one `code_item` live in `shared`; the bucket stores this bit.
+const SHARED_BIT: u32 = 1 << 31;
+
 struct InsnLocator {
     data_len: usize,
-    maps: HashMap<u32, Vec<u32>>,
+    /// Bucket index of `table[0]`.
+    base_bucket: u32,
+    /// One cell per 16-byte bucket: `NO_METHOD`, a method index, or `SHARED_BIT | shared index`.
+    table: Vec<u32>,
+    shared: Vec<Vec<u32>>,
     bounds: HashMap<u32, InsnSpan>,
     code_start: usize,
     code_end: usize,
@@ -424,13 +432,8 @@ fn fuzzy_class(name: &str) -> String {
 
 impl InsnLocator {
     fn parse(dex: &Dex) -> Result<Self> {
-        let mut locator = Self {
-            data_len: dex.data.len(),
-            maps: HashMap::new(),
-            bounds: HashMap::new(),
-            code_start: 0,
-            code_end: 0,
-        };
+        let mut entries = Vec::new();
+        let mut bounds = HashMap::new();
         let items = dex.map_items()?;
         let class_data = items.iter().find(|item| item.type_ == 0x2000);
         if dex.header.map_off != 0 && items.iter().any(|item| item.type_ == 0x2000) {
@@ -438,7 +441,7 @@ impl InsnLocator {
                 let mut pos = item.offset as usize;
                 for _ in 0..item.size {
                     let (class_data, next) = crate::dex::parse_class_data(dex.data, pos)?;
-                    locator.add_methods(dex.data, &class_data)?;
+                    collect_methods(dex.data, &class_data, &mut entries, &mut bounds)?;
                     pos = next;
                 }
             }
@@ -450,80 +453,81 @@ impl InsnLocator {
                 }
                 let (class_data, _) =
                     crate::dex::parse_class_data(dex.data, def.class_data_off as usize)?;
-                locator.add_methods(dex.data, &class_data)?;
+                collect_methods(dex.data, &class_data, &mut entries, &mut bounds)?;
             }
         }
-        if let (Some(min), Some(max)) = (locator.maps.keys().min(), locator.maps.keys().max()) {
-            locator.code_start = (*min as usize) << 4;
-            locator.code_end = ((*max as usize) + 1) << 4;
+        let mut locator = Self {
+            data_len: dex.data.len(),
+            base_bucket: 0,
+            table: Vec::new(),
+            shared: Vec::new(),
+            bounds,
+            code_start: 0,
+            code_end: 0,
+        };
+        if entries.is_empty() {
+            return Ok(locator);
+        }
+        let min_bucket = entries.iter().map(|entry| entry.0 >> 4).min().unwrap_or(0);
+        let max_bucket = entries
+            .iter()
+            .map(|entry| (entry.0 + entry.1 - 1) >> 4)
+            .max()
+            .unwrap_or(0);
+        let len = usize::try_from(max_bucket - min_bucket + 1)
+            .map_err(|_| crate::Error::new("code item region is too large"))?;
+        locator.base_bucket = min_bucket;
+        locator.table = vec![NO_METHOD; len];
+        locator.code_start = (min_bucket as usize) << 4;
+        locator.code_end = ((max_bucket as usize) + 1) << 4;
+        for (insn_off, size, method_idx) in entries {
+            let start = ((insn_off >> 4) - min_bucket) as usize;
+            let end = (((insn_off + size - 1) >> 4) - min_bucket) as usize;
+            // A free range is one fill. Overlap is per bucket so a later method
+            // does not claim instructions that belong to an earlier one.
+            if locator.table[start..=end]
+                .iter()
+                .all(|value| *value == NO_METHOD)
+            {
+                locator.table[start..=end].fill(method_idx);
+                continue;
+            }
+            for bucket in start..=end {
+                match locator.table[bucket] {
+                    NO_METHOD => locator.table[bucket] = method_idx,
+                    old if old == method_idx => {}
+                    old if old & SHARED_BIT != 0 => {
+                        let list = &mut locator.shared[(old & !SHARED_BIT) as usize];
+                        if !list.contains(&method_idx) {
+                            list.push(method_idx);
+                        }
+                    }
+                    old => {
+                        locator.shared.push(vec![old, method_idx]);
+                        locator.table[bucket] = SHARED_BIT | (locator.shared.len() as u32 - 1);
+                    }
+                }
+            }
         }
         Ok(locator)
-    }
-
-    fn add_methods(&mut self, data: &[u8], class_data: &crate::dex::ClassData) -> Result<()> {
-        for method in class_data.methods() {
-            self.add_method(data, method.code_off, method.method_idx)?;
-        }
-        Ok(())
-    }
-
-    fn add_method(&mut self, data: &[u8], code_off: u32, method_idx: u32) -> Result<()> {
-        if code_off == 0 {
-            return Ok(());
-        }
-        let pos = code_off as usize;
-        let insn_size = u32_at(data, pos + 12)? as usize;
-        if insn_size == 0 {
-            return Ok(());
-        }
-        let insn_off = pos + 16;
-        let insn_bytes = insn_size * 2;
-        if insn_off + insn_bytes > data.len() {
-            bail!("code item out of range at {code_off:#x}");
-        }
-        let start_bucket = (insn_off >> 4) as u32;
-        let end_bucket = ((insn_off + insn_bytes - 1) >> 4) as u32;
-        self.bounds.insert(
-            method_idx,
-            InsnSpan {
-                start: insn_off,
-                end: insn_off + insn_bytes,
-            },
-        );
-        for bucket in start_bucket..=end_bucket {
-            let slot = self.maps.entry(bucket).or_default();
-            if !slot.contains(&method_idx) {
-                slot.push(method_idx);
-            }
-        }
-        Ok(())
     }
 
     fn locate(&self, data: &[u8], offsets: &[usize]) -> Vec<Option<Vec<u32>>> {
         let mut cursor: HashMap<u32, usize> = HashMap::new();
         let mut out = Vec::with_capacity(offsets.len());
         for &offset in offsets {
-            let Some(methods) = self.maps.get(&((offset >> 4) as u32)) else {
-                out.push(None);
-                continue;
-            };
             let mut matched = Vec::new();
-            for &method in methods {
-                let Some(span) = self.bounds.get(&method) else {
-                    continue;
-                };
-                if offset < span.start || offset >= span.end {
-                    continue;
+            match self.bucket(offset) {
+                Bucket::Empty => {}
+                Bucket::One(method) => {
+                    self.accept(data, offset, method, &mut cursor, &mut matched);
                 }
-                let remembered = cursor.get(&method).copied().unwrap_or(span.start);
-                let start = if remembered <= offset {
-                    remembered
-                } else {
-                    span.start
-                };
-                if instructions_cover(data, start, offset) {
-                    cursor.insert(method, offset);
-                    matched.push(method);
+                Bucket::Shared(index) => {
+                    if let Some(methods) = self.shared.get(index) {
+                        for &method in methods {
+                            self.accept(data, offset, method, &mut cursor, &mut matched);
+                        }
+                    }
                 }
             }
             if matched.is_empty() {
@@ -534,6 +538,89 @@ impl InsnLocator {
         }
         out
     }
+
+    fn bucket(&self, offset: usize) -> Bucket {
+        let Some(bucket) = u32::try_from(offset >> 4).ok() else {
+            return Bucket::Empty;
+        };
+        if bucket < self.base_bucket {
+            return Bucket::Empty;
+        }
+        let index = (bucket - self.base_bucket) as usize;
+        match self.table.get(index).copied().unwrap_or(NO_METHOD) {
+            NO_METHOD => Bucket::Empty,
+            value if value & SHARED_BIT != 0 => Bucket::Shared((value & !SHARED_BIT) as usize),
+            value => Bucket::One(value),
+        }
+    }
+
+    fn accept(
+        &self,
+        data: &[u8],
+        offset: usize,
+        method: u32,
+        cursor: &mut HashMap<u32, usize>,
+        matched: &mut Vec<u32>,
+    ) {
+        let Some(span) = self.bounds.get(&method) else {
+            return;
+        };
+        if offset < span.start || offset >= span.end {
+            return;
+        }
+        let remembered = cursor.get(&method).copied().unwrap_or(span.start);
+        let start = if remembered <= offset {
+            remembered
+        } else {
+            span.start
+        };
+        if instructions_cover(data, start, offset) {
+            cursor.insert(method, offset);
+            matched.push(method);
+        }
+    }
+}
+
+enum Bucket {
+    Empty,
+    One(u32),
+    Shared(usize),
+}
+
+fn collect_methods(
+    data: &[u8],
+    class_data: &crate::dex::ClassData,
+    entries: &mut Vec<(u32, u32, u32)>,
+    bounds: &mut HashMap<u32, InsnSpan>,
+) -> Result<()> {
+    for method in class_data.methods() {
+        if method.code_off == 0 || method.method_idx & SHARED_BIT != 0 {
+            continue;
+        }
+        let pos = method.code_off as usize;
+        let insn_size = u32_at(data, pos + 12)? as usize;
+        if insn_size == 0 {
+            continue;
+        }
+        let insn_off = pos + 16;
+        let insn_bytes = insn_size * 2;
+        if insn_off + insn_bytes > data.len() {
+            bail!("code item out of range at {:#x}", method.code_off);
+        }
+        let (Ok(insn_off), Ok(insn_bytes)) = (u32::try_from(insn_off), u32::try_from(insn_bytes))
+        else {
+            bail!("code item out of range at {:#x}", method.code_off);
+        };
+        bounds.insert(
+            method.method_idx,
+            InsnSpan {
+                start: insn_off as usize,
+                end: insn_off as usize + insn_bytes as usize,
+            },
+        );
+        entries.push((insn_off, insn_bytes, method.method_idx));
+    }
+    Ok(())
 }
 
 fn instructions_cover(data: &[u8], start: usize, end: usize) -> bool {
@@ -577,46 +664,12 @@ fn scan(
     }
     let end = locator.code_end.min(data.len()).min(locator.data_len);
     let start = locator.code_start.min(end);
-    let mut hits = Vec::new();
-    match kind {
-        Kind::String => {
-            scan_group(data, start, end, &[0x1a], 2, idxs, &mut hits);
-            scan_group(data, start, end, &[0x1b], 4, idxs, &mut hits);
-            hits.sort_by_key(|hit| hit.0);
-        }
-        Kind::Type => scan_group(
-            data,
-            start,
-            end,
-            &[0x1c, 0x1f, 0x20, 0x22, 0x23, 0x24, 0x25],
-            2,
-            idxs,
-            &mut hits,
-        ),
-        Kind::Field => scan_group(
-            data,
-            start,
-            end,
-            &[
-                0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f,
-                0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d,
-            ],
-            2,
-            idxs,
-            &mut hits,
-        ),
-        Kind::Method => scan_group(
-            data,
-            start,
-            end,
-            &[
-                0x6e, 0x6f, 0x70, 0x71, 0x72, 0x74, 0x75, 0x76, 0x77, 0x78, 0xfa, 0xfb,
-            ],
-            2,
-            idxs,
-            &mut hits,
-        ),
-    }
+    let region = &data[start..end];
+    let hits = if idxs.len() <= MEMMEM_MAX_TARGETS {
+        scan_by_operand(region, start, kind, idxs)
+    } else {
+        scan_by_opcode(region, start, kind, idxs)
+    };
     let offsets: Vec<usize> = hits.iter().map(|hit| hit.0).collect();
     let methods = locator.locate(data, &offsets);
     methods
@@ -625,41 +678,196 @@ fn scan(
         .collect()
 }
 
-fn scan_group(
-    data: &[u8],
-    start: usize,
-    end: usize,
-    opcodes: &[u8],
-    width: usize,
+/// Operand width of `opcode` for this query. `0` means the opcode is not one we search.
+fn opcode_width(kind: Kind, opcode: u8) -> u8 {
+    match kind {
+        Kind::String => match opcode {
+            0x1a => 2,
+            0x1b => 4,
+            _ => 0,
+        },
+        Kind::Type => {
+            if matches!(opcode, 0x1c | 0x1f | 0x20 | 0x22 | 0x23 | 0x24 | 0x25) {
+                2
+            } else {
+                0
+            }
+        }
+        Kind::Field => {
+            if (0x52..=0x6d).contains(&opcode) {
+                2
+            } else {
+                0
+            }
+        }
+        Kind::Method => {
+            if (0x6e..=0x72).contains(&opcode)
+                || (0x74..=0x78).contains(&opcode)
+                || opcode == 0xfa
+                || opcode == 0xfb
+            {
+                2
+            } else {
+                0
+            }
+        }
+    }
+}
+
+/// At most this many targets: searching each operand with `memmem` beats one sweep.
+const MEMMEM_MAX_TARGETS: usize = 8;
+
+fn scan_by_operand(
+    region: &[u8],
+    base: usize,
+    kind: Kind,
+    idxs: &HashSet<u32>,
+) -> Vec<(usize, u32)> {
+    let mut hits = Vec::new();
+    for &idx in idxs {
+        let narrow = (idx as u16).to_le_bytes();
+        let wide = idx.to_le_bytes();
+        let needles: [(&[u8], u8); 2] = [(&narrow, 2), (&wide, 4)];
+        for (needle, width) in needles {
+            if width == 2 && idx > u32::from(u16::MAX) {
+                continue;
+            }
+            if width == 4 && kind != Kind::String {
+                continue;
+            }
+            let finder = memchr::memmem::Finder::new(needle);
+            // Resume one byte later. A self-overlapping needle would otherwise
+            // skip the real operand after a hit that landed one byte early.
+            let mut from = 0;
+            while let Some(rel) = finder.find(&region[from..]) {
+                let pos = from + rel;
+                from = pos + 1;
+                if pos >= 2 && opcode_width(kind, region[pos - 2]) == width {
+                    hits.push((base + pos - 2, idx));
+                }
+            }
+        }
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    hits
+}
+
+fn scan_by_opcode(
+    region: &[u8],
+    base: usize,
+    kind: Kind,
+    idxs: &HashSet<u32>,
+) -> Vec<(usize, u32)> {
+    let mut hits = Vec::new();
+    if kind == Kind::String {
+        for index in memchr::memchr2_iter(0x1a, 0x1b, region) {
+            push_candidate(region, base, kind, idxs, index, &mut hits);
+        }
+        return hits;
+    }
+    let mut highs: Vec<u8> = idxs.iter().map(|idx| (idx >> 8) as u8).collect();
+    highs.sort_unstable();
+    highs.dedup();
+    if !prefilter_is_selective(&highs) {
+        linear_sweep(region, base, kind, idxs, &mut hits);
+        return hits;
+    }
+    match highs.as_slice() {
+        [a] => {
+            for index in memchr::memchr_iter(*a, region) {
+                if index >= 3 {
+                    push_candidate(region, base, kind, idxs, index - 3, &mut hits);
+                }
+            }
+        }
+        [a, b] => {
+            for index in memchr::memchr2_iter(*a, *b, region) {
+                if index >= 3 {
+                    push_candidate(region, base, kind, idxs, index - 3, &mut hits);
+                }
+            }
+        }
+        [a, b, c] => {
+            for index in memchr::memchr3_iter(*a, *b, *c, region) {
+                if index >= 3 {
+                    push_candidate(region, base, kind, idxs, index - 3, &mut hits);
+                }
+            }
+        }
+        _ => linear_sweep(region, base, kind, idxs, &mut hits),
+    }
+    hits
+}
+
+fn prefilter_is_selective(highs: &[u8]) -> bool {
+    highs.len() <= 3 && !highs.iter().any(|byte| *byte == 0x00 || *byte == 0xff)
+}
+
+fn push_candidate(
+    region: &[u8],
+    base: usize,
+    kind: Kind,
+    idxs: &HashSet<u32>,
+    index: usize,
+    hits: &mut Vec<(usize, u32)>,
+) {
+    let width = opcode_width(kind, region[index]);
+    if width == 0 {
+        return;
+    }
+    let idx = if width == 2 {
+        let Some(bytes) = region.get(index + 2..index + 4) else {
+            return;
+        };
+        u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+    } else {
+        let Some(bytes) = region.get(index + 2..index + 6) else {
+            return;
+        };
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    if idxs.contains(&idx) {
+        hits.push((base + index, idx));
+    }
+}
+
+fn linear_sweep(
+    region: &[u8],
+    base: usize,
+    kind: Kind,
     idxs: &HashSet<u32>,
     hits: &mut Vec<(usize, u32)>,
 ) {
-    if end < start + 2 + width {
-        return;
+    let mut widths = [0u8; 256];
+    for (opcode, width) in widths.iter_mut().enumerate() {
+        *width = opcode_width(kind, opcode as u8);
     }
-    let mut wanted = [false; 256];
-    for opcode in opcodes {
-        wanted[*opcode as usize] = true;
-    }
-    let last = end - 2 - width;
-    for pos in start..=last {
-        if !wanted[data[pos] as usize] {
+    for (index, byte) in region.iter().enumerate() {
+        if widths[*byte as usize] == 0 {
             continue;
         }
-        let idx = if width == 4 {
-            u32::from_le_bytes([data[pos + 2], data[pos + 3], data[pos + 4], data[pos + 5]])
-        } else {
-            u32::from(u16::from_le_bytes([data[pos + 2], data[pos + 3]]))
-        };
-        if idxs.contains(&idx) {
-            hits.push((pos, idx));
-        }
+        push_candidate(region, base, kind, idxs, index, hits);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{byte_regex, fuzzy_class, has_at_ref};
+
+    #[test]
+    fn operand_and_opcode_scans_find_the_same_string() {
+        // const-string v0, string@1 at offset 0, then padding, then const-string/jumbo.
+        let mut region = vec![0x1a, 0x00, 0x01, 0x00, 0, 0, 0, 0];
+        region.extend_from_slice(&[0x1b, 0x00, 0x02, 0x00, 0x00, 0x00]);
+        let idxs: HashSet<u32> = [1, 2].into_iter().collect();
+        let by_operand = super::scan_by_operand(&region, 10, super::Kind::String, &idxs);
+        let by_opcode = super::scan_by_opcode(&region, 10, super::Kind::String, &idxs);
+        assert_eq!(by_operand, vec![(10, 1), (18, 2)]);
+        assert_eq!(by_opcode, vec![(10, 1), (18, 2)]);
+    }
 
     #[test]
     fn only_real_resource_tokens_look_like_references() {

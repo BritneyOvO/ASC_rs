@@ -25,6 +25,8 @@ asc findrefs app.hap string token
 asc findrefs app.hap method onCreate --class com.poc.Main
 asc getclass classes.dex Lcom/example/Main; --resources resources.arsc
 asc getclass modules.abc Ldemo/App; --resources resources
+asc diff old.apk new.apk
+asc diff --prefix assets/ old.apk new.apk
 ```
 
 `getclass` 和 `dump` 默认用 [ddc](https://github.com/ejfkdev/ddc) 把方法体收成带控制流的 Java。`--engine smali` 输出 baksmali 文本，指令名和寄存器都保留。`listclass`、`findrefs`、清单，以及 HAP / ABC，不走 ddc。
@@ -35,7 +37,7 @@ asc getclass modules.abc Ldemo/App; --resources resources
 
 中央目录里任何一条记录读不通都按错误上报，不再静默截断条目列表；`find_eocd` 会核对注释长度，压缩包注释里出现 `PK\x05\x06` 不会被误判。单个条目解压上限为 1 GiB，并且不会超过中央目录声明的解压大小；声明为 0 时按 deflate 的 1032 倍膨胀率上界收紧。HAP 的 `dump` 逐成员容错：读不通的 `.abc` 会告警并计入 `errors`，其余成员照常导出。
 
-`PANDA` 开头的 `.abc` 按方舟文件头现查类名、成员和字面量字符串，不建全量索引。HAP 里的代码在 `ets/modules.abc` 和其它 `*.abc`。`getmanifest` 读模块配置 `module.json`（没有则读 `config.json`）和包级 `pack.info`，并把 `$string:`、`$media:`、`$profile:` 换成 `resources/` 里的值。APK 清单里的 `@string/`、`@mipmap/` 和 `@0x7f......` 会换成 `resources.arsc` 或 `res/` 里的实际值。同一张表也写回 DEX：`getclass` 和 `dump` 里的常量、`R$type;->name`、字符串中的 `@string/`，以及 `findrefs` 命中的字符串和字段，都换成解析后的值。HAP 里 ABC 的类文本和字面量同样把 `$string:`、`$media:`、`$profile:` 换成资源值，所以按解析后的文本搜索也能命中。解压过的 DEX 会缓存在 `~/.cache/asc`（也可用 `$ASC_CACHE_DIR` 或 `$XDG_CACHE_HOME/asc`），`--no-cache` 关闭。`getclass` 先只解出头、id 表和字符串区来判断类在不在，命中后再整份解压。单独打开的 `.dex` 和 `.abc` 默认不解析资源，原文保持不动。`getclass`、`findrefs` 和 `dump` 可以用 `--resources` 打开解析：DEX 指向 `resources.arsc`，ABC 指向 `resources` 目录或带这份资源的 HAP。`listclass`、`getclass`、`findrefs`、`getmanifest` 和 `dump` 可以直接读 HAP。裸 DEX 和裸 ABC 没有清单。
+`PANDA` 开头的 `.abc` 按方舟文件头现查类名、成员和字面量字符串，不建全量索引。HAP 里的代码在 `ets/modules.abc` 和其它 `*.abc`。`getmanifest` 读模块配置 `module.json`（没有则读 `config.json`）和包级 `pack.info`，并把 `$string:`、`$media:`、`$profile:` 换成 `resources/` 里的值。APK 清单里的 `@string/`、`@mipmap/` 和 `@0x7f......` 会换成 `resources.arsc` 或 `res/` 里的实际值。同一张表也写回 DEX：`getclass` 和 `dump` 里的常量、`R$type;->name`、字符串中的 `@string/`，以及 `findrefs` 命中的字符串和字段，都换成解析后的值。HAP 里 ABC 的类文本和字面量同样把 `$string:`、`$media:`、`$profile:` 换成资源值，所以按解析后的文本搜索也能命中。解压过的 DEX 会缓存在 `~/.cache/asc`（也可用 `$ASC_CACHE_DIR` 或 `$XDG_CACHE_HOME/asc`），`--no-cache` 关闭。`getclass` 先只解出头、id 表和字符串区来判断类在不在，命中后再整份解压。单独打开的 `.dex` 和 `.abc` 默认不解析资源，原文保持不动。`getclass`、`findrefs` 和 `dump` 可以用 `--resources` 打开解析：DEX 指向 `resources.arsc`，ABC 指向 `resources` 目录或带这份资源的 HAP。`listclass`、`getclass`、`findrefs`、`getmanifest` 和 `dump` 可以直接读 HAP。裸 DEX 和裸 ABC 没有清单。`asc diff` 只按中央目录里的路径和 CRC 比较两个 ZIP，不解压、不看类。相同文件只计数。APK 按 `assets/`、`res/`、`lib/`、DEX、清单、`resources.arsc` 分组；HAP/HSP 再认 `module.json`、`pack.info`、`ets/*.abc`、`libs/`、`resources/`。`META-INF` 原始文件不参与比较。APK 证书来自 `META-INF/*.RSA`、`*.DSA`、`*.EC`，HAP/HSP 证书来自 `<hap sign block>`，都只比 SHA-256、主体、颁发者、序列号和有效期。
 
 同名类在 `getclass` 和 `dump` 里按运行时顺序保留：`classes.dex`、`classes2.dex`、`classes10.dex`，其余根目录 DEX 按中央目录顺序排在后面。Android App Bundle 里的代码在 `<module>/dex/*.dex`，清单在 `base/manifest/AndroidManifest.xml`（aapt2 protobuf XML）；同名类先保留 `base` 模块，再保留其它模块。ZIP 读取支持 store、deflate、数据描述符和 ZIP64。中央目录里的 CRC 非 0 时会核对解压结果，不一致时在标准错误告警并继续读取；CRC 为 0 的条目不核对。
 

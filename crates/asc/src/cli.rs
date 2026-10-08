@@ -53,6 +53,8 @@ DEX uses a resources.arsc file. ABC uses a resources directory or a HAP.
 findrefs exits 2 when a DEX entry could not be searched; other hits are still printed.
 Inflated DEX entries are cached under ~/.cache/asc unless --no-cache is set.
 
+  asc diff old.apk new.apk
+  asc diff --prefix assets/ old.apk new.apk
   asc skills install
 
 asc skills install writes:
@@ -72,6 +74,12 @@ enum EngineArg {
     Ddc,
     /// Baksmali text.
     Smali,
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
 }
 
 fn engine_of(arg: EngineArg) -> Engine {
@@ -125,7 +133,7 @@ enum Commands {
     Getclass {
         #[arg(long)]
         debug: bool,
-        #[arg(long, alias = "thread", default_value_t = 8)]
+        #[arg(long, alias = "thread", default_value_t = default_threads())]
         threads: usize,
         /// `ddc` writes Java. `smali` writes baksmali text.
         #[arg(long, value_enum, default_value = "ddc")]
@@ -144,7 +152,7 @@ enum Commands {
     Listclass {
         #[arg(long)]
         debug: bool,
-        #[arg(long, alias = "thread", default_value_t = 8)]
+        #[arg(long, alias = "thread", default_value_t = default_threads())]
         threads: usize,
         /// Package or class prefix, for example com.poc or Lcom/poc.
         #[arg(long)]
@@ -167,7 +175,7 @@ enum Commands {
     Dump {
         #[arg(long)]
         debug: bool,
-        #[arg(long, alias = "thread", default_value_t = 8)]
+        #[arg(long, alias = "thread", default_value_t = default_threads())]
         threads: usize,
         /// Decompiler for method bodies. Defaults to ddc.
         #[arg(long, value_enum, default_value = "ddc")]
@@ -185,7 +193,7 @@ enum Commands {
     Findrefs {
         #[arg(long, global = true)]
         debug: bool,
-        #[arg(long, global = true, alias = "thread", default_value_t = 8)]
+        #[arg(long, global = true, alias = "thread", default_value_t = default_threads())]
         threads: usize,
         /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
         #[arg(long, global = true, value_name = "FILE")]
@@ -195,6 +203,16 @@ enum Commands {
         apk_path: PathBuf,
         #[command(subcommand)]
         query: FindCmd,
+    },
+    /// Compare two APK, HAP, or HSP archives by file path and CRC.
+    Diff {
+        /// Only entries whose path starts with this prefix, such as assets/.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// The earlier archive.
+        left: PathBuf,
+        /// The later archive.
+        right: PathBuf,
     },
     /// Install the ASC skill.
     Skills {
@@ -502,6 +520,23 @@ fn execute(cli: Cli) -> Result<Exit> {
                 format!("{}\n", lines.join("\n"))
             };
             emit(&text, output.as_deref(), false)?;
+        }
+        Commands::Diff {
+            prefix,
+            left,
+            right,
+        } => {
+            let left_archive = asc_diff::Archive::open(&left).map_err(Error::external)?;
+            let right_archive = asc_diff::Archive::open(&right).map_err(Error::external)?;
+            let report = match prefix.as_deref() {
+                Some(prefix) => asc_diff::ArchiveDiff::between_prefix(
+                    &left_archive,
+                    &right_archive,
+                    prefix,
+                ),
+                None => asc_diff::ArchiveDiff::between(&left_archive, &right_archive),
+            };
+            print!("{report}");
         }
         Commands::Skills { action } => match action {
             SkillsCmd::Install => install_user_skills()?,

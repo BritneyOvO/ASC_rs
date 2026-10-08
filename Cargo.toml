@@ -20,5 +20,6 @@ asc-axml = { path = "crates/asc-axml" }
 asc-apk = { path = "crates/asc-apk" }
 asc-abc = { path = "crates/asc-abc" }
 asc-hap = { path = "crates/asc-hap" }
+asc-diff = { path = "crates/asc-diff" }
 ddc-dec = "0.1.24"
 ddc-dex = "0.2.5"

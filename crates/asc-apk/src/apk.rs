@@ -55,7 +55,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            threads: 8,
+            threads: default_threads(),
             debug: false,
             engine: Engine::Ddc,
             resources: None,
@@ -781,6 +781,12 @@ fn inflate_entry(apk: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
             header_offset: entry.local_header_off,
         },
     )
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
 }
 
 fn check_threads(threads: usize) -> Result<()> {
