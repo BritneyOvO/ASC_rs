@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-use asc_abc::{class_names, class_text, find_members, find_strings, find_types, is_abc};
+use asc_abc::{
+    class_names, class_text, find_members, find_strings, find_strings_resolved, find_types, is_abc,
+};
 use asc_apk::{
-    dump_apk, find_refs, get_class_source, list_classes, manifest_xml, Engine, Error, MemberSel,
-    Options, RefQuery, Result,
+    dump_apk, find_refs, get_class_source, is_dex, list_classes, manifest_xml, Engine, Error,
+    MemberSel, Options, RefQuery, Result,
 };
 use asc_hap::{self, Query};
 
@@ -36,10 +38,17 @@ examples:
   asc dump app.hap -o output
   asc findrefs app.hap string token
   asc findrefs app.hap method onCreate --class com.poc.Main
+  asc getclass classes.dex Lcom/example/Main;
+  asc getclass classes.dex Lcom/example/Main; --resources resources.arsc
+  asc getclass modules.abc Ldemo/App;
+  asc getclass modules.abc Ldemo/App; --resources resources
+  asc findrefs modules.abc string token --resources app.hap
 
 HAP commands read ets/modules.abc and other .abc members. getmanifest prints
 module.json, or config.json when that file is absent, plus pack.info.
---engine applies to APK getclass and dump only.
+--engine applies to APK and bare DEX getclass and dump only.
+A bare DEX or ABC file does not resolve resources unless --resources is set.
+DEX uses a resources.arsc file. ABC uses a resources directory or a HAP.
 
   asc skills install
 
@@ -69,17 +78,23 @@ fn engine_of(arg: EngineArg) -> Engine {
     }
 }
 
-fn apk_options(threads: usize, debug: bool, engine: Engine) -> Options {
+fn apk_options(
+    threads: usize,
+    debug: bool,
+    engine: Engine,
+    resources: Option<PathBuf>,
+) -> Options {
     Options {
         threads,
         debug,
         engine,
+        resources,
     }
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Decompile one class from an APK, HAP, or ABC.
+    /// Decompile one class from an APK, DEX, HAP, or ABC.
     Getclass {
         #[arg(long)]
         debug: bool,
@@ -92,8 +107,11 @@ enum Commands {
         output: Option<PathBuf>,
         apk_path: PathBuf,
         dalvik_class: String,
+        /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
+        #[arg(long, value_name = "FILE")]
+        resources: Option<PathBuf>,
     },
-    /// List classes in an APK, HAP, or ABC.
+    /// List classes in an APK, DEX, HAP, or ABC.
     Listclass {
         #[arg(long)]
         debug: bool,
@@ -114,7 +132,7 @@ enum Commands {
         output: Option<PathBuf>,
         apk_path: PathBuf,
     },
-    /// Decompile every class in an APK or HAP.
+    /// Decompile every class in an APK, DEX, HAP, or ABC.
     Dump {
         #[arg(long)]
         debug: bool,
@@ -126,13 +144,19 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
         apk_path: PathBuf,
+        /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
+        #[arg(long, value_name = "FILE")]
+        resources: Option<PathBuf>,
     },
-    /// Find references in an APK, HAP, or ABC.
+    /// Find references in an APK, DEX, HAP, or ABC.
     Findrefs {
         #[arg(long, global = true)]
         debug: bool,
         #[arg(long, global = true, alias = "thread", default_value_t = 8)]
         threads: usize,
+        /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
+        #[arg(long, global = true, value_name = "FILE")]
+        resources: Option<PathBuf>,
         apk_path: PathBuf,
         #[command(subcommand)]
         query: FindCmd,
@@ -238,17 +262,21 @@ fn execute(cli: Cli) -> Result<()> {
             output,
             apk_path,
             dalvik_class,
+            resources,
         } => {
             let source = if let Some(data) = read_abc(&apk_path)? {
-                class_text(&data, &dalvik_class).map_err(abc_err)?
+                let text = class_text(&data, &dalvik_class).map_err(abc_err)?;
+                let table = abc_resources(resources.as_deref())?;
+                table.annotate(&text).into_owned()
             } else if hap_file(&apk_path)? {
+                archive_resources(&resources)?;
                 asc_hap::get_class_source(&apk_path, &dalvik_class, &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
                 get_class_source(
                     &apk_path,
                     &dalvik_class,
-                    &apk_options(threads, debug, engine_of(engine)),
+                    &apk_options(threads, debug, engine_of(engine), resources),
                 )?
             };
             emit(&source, output.as_deref(), true)?;
@@ -269,7 +297,7 @@ fn execute(cli: Cli) -> Result<()> {
                 list_classes(
                     &apk_path,
                     prefix.as_deref(),
-                    &apk_options(threads, debug, Engine::Ddc),
+                    &apk_options(threads, debug, Engine::Ddc, None),
                 )?
             };
             let text = if names.is_empty() {
@@ -290,6 +318,9 @@ fn execute(cli: Cli) -> Result<()> {
         } => {
             if read_abc(&apk_path)?.is_some() {
                 return Err(Error::new("ABC files have no AndroidManifest.xml"));
+            }
+            if is_dex(&apk_path)? {
+                return Err(Error::new("DEX files have no manifest"));
             }
             if hap_file(&apk_path)? {
                 let text = asc_hap::module_json(&apk_path).map_err(hap_err)?;
@@ -312,11 +343,21 @@ fn execute(cli: Cli) -> Result<()> {
             engine,
             output,
             apk_path,
+            resources,
         } => {
-            if read_abc(&apk_path)?.is_some() {
-                return Err(Error::new("dump does not read ABC files"));
+            if let Some(data) = read_abc(&apk_path)? {
+                let table = abc_resources(resources.as_deref())?;
+                let stats = asc_hap::dump_abc(&data, &output, &table).map_err(hap_err)?;
+                eprintln!(
+                    "dumped {} classes ({} errors) -> {}",
+                    stats.classes,
+                    stats.errors,
+                    output.display()
+                );
+                return Ok(());
             }
             if hap_file(&apk_path)? {
+                archive_resources(&resources)?;
                 let stats = asc_hap::dump_hap(&apk_path, &output, &hap_options(threads, debug))
                     .map_err(hap_err)?;
                 eprintln!(
@@ -331,7 +372,7 @@ fn execute(cli: Cli) -> Result<()> {
             let stats = dump_apk(
                 &apk_path,
                 &output,
-                &apk_options(threads, debug, engine_of(engine)),
+                &apk_options(threads, debug, engine_of(engine), resources),
             )?;
             eprintln!(
                 "dumped {} classes ({} errors) -> {}",
@@ -349,6 +390,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Findrefs {
             debug,
             threads,
+            resources,
             apk_path,
             query,
         } => {
@@ -383,15 +425,17 @@ fn execute(cli: Cli) -> Result<()> {
                 ),
             };
             let lines = if let Some(data) = read_abc(&apk_path)? {
-                abc_refs(&data, &apk_path, &query)?
+                let table = abc_resources(resources.as_deref())?;
+                abc_refs(&data, &apk_path, &query, &table)?
             } else if hap_file(&apk_path)? {
+                archive_resources(&resources)?;
                 asc_hap::find_refs(&apk_path, hap_query(&query), &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
                 find_refs(
                     &apk_path,
                     &query,
-                    &apk_options(threads, debug, Engine::Ddc),
+                    &apk_options(threads, debug, Engine::Ddc, resources),
                 )?
             };
             let text = if lines.is_empty() {
@@ -463,6 +507,27 @@ fn hap_file(path: &Path) -> Result<bool> {
     asc_hap::is_hap(path).map_err(hap_err)
 }
 
+fn archive_resources(resources: &Option<PathBuf>) -> Result<()> {
+    if resources.is_some() {
+        bail_resources()
+    } else {
+        Ok(())
+    }
+}
+
+fn bail_resources() -> Result<()> {
+    Err(Error::new(
+        "--resources is only used with a bare DEX or ABC file",
+    ))
+}
+
+fn abc_resources(path: Option<&Path>) -> Result<asc_hap::HapResources> {
+    match path {
+        None => Ok(asc_hap::HapResources::default()),
+        Some(path) => asc_hap::load_resources(path).map_err(hap_err),
+    }
+}
+
 fn hap_options(threads: usize, debug: bool) -> asc_hap::Options {
     asc_hap::Options { threads, debug }
 }
@@ -482,10 +547,21 @@ fn hap_query(query: &RefQuery) -> Query<'_> {
     }
 }
 
-fn abc_refs(data: &[u8], path: &Path, query: &RefQuery) -> Result<Vec<String>> {
+fn abc_refs(
+    data: &[u8],
+    path: &Path,
+    query: &RefQuery,
+    resources: &asc_hap::HapResources,
+) -> Result<Vec<String>> {
     let file = path.display().to_string();
     match query {
-        RefQuery::String(pattern) => find_strings(data, &file, pattern).map_err(abc_err),
+        RefQuery::String(pattern) if resources.is_empty() => {
+            find_strings(data, &file, pattern).map_err(abc_err)
+        }
+        RefQuery::String(pattern) => find_strings_resolved(data, &file, pattern, &|raw| {
+            resources.resolve_literal(raw)
+        })
+        .map_err(abc_err),
         RefQuery::Type(pattern) => find_types(data, &file, pattern).map_err(abc_err),
         RefQuery::Method(sel) => abc_members(data, &file, true, sel),
         RefQuery::Field(sel) => abc_members(data, &file, false, sel),

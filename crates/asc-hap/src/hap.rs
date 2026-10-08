@@ -213,16 +213,79 @@ fn find_string_refs(
 }
 
 fn resolve_literal(resources: &crate::resources::HapResources, bytes: &[u8]) -> Option<String> {
-    if !bytes.contains(&b'$') {
-        return None;
+    resources.resolve_literal(bytes)
+}
+
+/// Loads Harmony resources for a bare ABC file.
+///
+/// `path` is a `resources/` directory, a directory that contains `resources/`,
+/// or a HAP/ZIP that stores that tree. A bare ABC does not consult this unless
+/// the caller asks.
+pub fn load_resources(path: &Path) -> Result<crate::resources::HapResources> {
+    if path.is_dir() {
+        return crate::resources::HapResources::from_dir(path);
     }
-    let shown = String::from_utf8_lossy(bytes);
-    let resolved = resources.annotate(shown.as_ref());
-    if resolved.as_ref() == shown.as_ref() {
-        None
-    } else {
-        Some(resolved.into_owned())
+    let opened = match open_hap(path) {
+        Ok(opened) => opened,
+        Err(Error::Message(message)) if message.contains("EOCD") => {
+            bail!(
+                "{} is not a Harmony resource directory or HAP",
+                path.display()
+            );
+        }
+        Err(err) => return Err(err),
+    };
+    let (_file, map) = opened;
+    let entries = zip_entries(&map)?;
+    let resources = crate::resources::HapResources::index(&map, &entries);
+    if resources.is_empty() {
+        bail!("{} contains no Harmony resources", path.display());
     }
+    Ok(resources)
+}
+
+/// Writes one bare ABC file. Resource tokens stay as written unless `resources`
+/// has entries.
+pub fn dump_abc(
+    data: &[u8],
+    out_dir: &Path,
+    resources: &crate::resources::HapResources,
+) -> Result<DumpStats> {
+    fs::create_dir_all(out_dir)?;
+    let names = class_names(data, None)?;
+    let mut classes = 0usize;
+    let mut errors = 0usize;
+    for name in names {
+        let text = match class_text_optional(data, &name) {
+            Ok(Some(text)) => resources.annotate(&text).into_owned(),
+            Ok(None) => {
+                errors += 1;
+                eprintln!("warning: {name} is indexed but has no body");
+                continue;
+            }
+            Err(err) => {
+                errors += 1;
+                eprintln!("warning: {name}: {err}");
+                continue;
+            }
+        };
+        let dest = class_output_path(out_dir, &name);
+        if let Some(parent) = dest.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                errors += 1;
+                eprintln!("warning: {name}: {err}");
+                continue;
+            }
+        }
+        match fs::write(&dest, text) {
+            Ok(()) => classes += 1,
+            Err(err) => {
+                errors += 1;
+                eprintln!("warning: {}: {err}", dest.display());
+            }
+        }
+    }
+    Ok(DumpStats { classes, errors })
 }
 
 fn scan_code<F>(
@@ -860,8 +923,10 @@ fn u64_at(data: &[u8], off: usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dump_hap, find_refs, get_class_source, is_hap, list_classes, module_json, Options, Query,
+        dump_abc, dump_hap, find_refs, get_class_source, is_hap, list_classes, load_resources,
+        module_json, Options, Query,
     };
+    use crate::resources::HapResources;
 
     fn options() -> Options {
         Options {
@@ -1104,6 +1169,33 @@ mod tests {
         assert!(out.join("demo/App.ets").is_file());
         let dumped = std::fs::read_to_string(out.join("demo/App.ets")).unwrap();
         assert!(dumped.contains("public i32 Hello;"), "{dumped}");
+
+        let bare = dir.join("modules.abc");
+        std::fs::write(&bare, &abc).unwrap();
+        let raw = asc_abc::class_text(&abc, "demo.App").unwrap();
+        assert!(raw.contains("$string:app_name"), "{raw}");
+        let resource_dir = dir.join("resroot");
+        std::fs::create_dir_all(resource_dir.join("base/element")).unwrap();
+        std::fs::write(
+            resource_dir.join("base/element/string.json"),
+            strings,
+        )
+        .unwrap();
+        let external = load_resources(&resource_dir).unwrap();
+        let filled = external.annotate(&raw);
+        assert!(filled.contains("Hello"), "{filled}");
+        assert!(!filled.contains("$string:"), "{filled}");
+        let bare_out = dir.join("bare-out");
+        let stats = dump_abc(&abc, &bare_out, &external).unwrap();
+        assert_eq!(stats.classes, 2);
+        assert!(std::fs::read_to_string(bare_out.join("demo/App.ets"))
+            .unwrap()
+            .contains("Hello"));
+        let untouched = dump_abc(&abc, &dir.join("raw-out"), &HapResources::default()).unwrap();
+        assert_eq!(untouched.classes, 2);
+        assert!(std::fs::read_to_string(dir.join("raw-out/demo/App.ets"))
+            .unwrap()
+            .contains("$string:app_name"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

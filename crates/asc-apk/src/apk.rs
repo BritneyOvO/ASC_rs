@@ -41,6 +41,10 @@ pub struct Options {
     pub threads: usize,
     pub debug: bool,
     pub engine: Engine,
+    /// `resources.arsc` for a bare DEX file. Archive inputs ignore this and
+    /// keep using the table stored in the package. `None` leaves a bare DEX
+    /// unresolved.
+    pub resources: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -49,6 +53,7 @@ impl Default for Options {
             threads: 8,
             debug: false,
             engine: Engine::Ddc,
+            resources: None,
         }
     }
 }
@@ -94,6 +99,10 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
         Some(value) => Some(normalize_prefix(value)?),
         None => None,
     };
+    if let Some(data) = read_bare_dex(path)? {
+        return list_bare_dex(path, data, prefix.as_deref(), options);
+    }
+    reject_external_resources(options)?;
     let started = Instant::now();
     let (_file, map) = open_apk(path)?;
     let entries = parse_cd_dex_entries(&map)?;
@@ -132,6 +141,10 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
 pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Result<String> {
     check_threads(options.threads)?;
     let descriptor = normalize_dalvik_class(class_name)?;
+    if let Some(data) = read_bare_dex(path)? {
+        return class_source_dex(path, data, &descriptor, options);
+    }
+    reject_external_resources(options)?;
     let started = Instant::now();
     let (_file, map) = open_apk(path)?;
     let mut entries = parse_cd_dex_entries(&map)?;
@@ -178,6 +191,10 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
 pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpStats> {
     check_threads(options.threads)?;
     let started = Instant::now();
+    if let Some(data) = read_bare_dex(path)? {
+        return dump_bare_dex(path, data, out_dir, options);
+    }
+    reject_external_resources(options)?;
     fs::create_dir_all(out_dir)?;
     let (_file, map) = open_apk(path)?;
     let resources = load_resource_table(&map);
@@ -230,7 +247,7 @@ fn dump_dex_entry(
     rank_base: (u8, u8, u32, u32),
     claims: &Mutex<HashMap<PathBuf, ClassRank>>,
     dirs: &Mutex<HashSet<PathBuf>>,
-    _resources: &crate::arsc::ResourceTable,
+    resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
     let data = inflate_dex(apk, entry)?;
     let mut errors = 0usize;
@@ -242,35 +259,15 @@ fn dump_dex_entry(
             tie: rank_base.3,
             logical: logical as u32,
         };
-        let dex = Dex::parse(&buf)?;
-        for index in 0..dex.header.class_defs_size {
-            let def = dex.class_def(index)?;
-            let class_desc = match dex.type_desc(def.class_idx) {
-                Ok(desc) => desc,
-                Err(err) => {
-                    errors += 1;
-                    if options.debug {
-                        eprintln!(
-                            "[APK] '{}' class_idx={} type error: {err}",
-                            entry.name, def.class_idx
-                        );
-                    }
-                    continue;
-                }
-            };
-            match smali_class_def(&dex, &def) {
-                Ok(source) => {
-                    let dest = class_output_path(out_dir, &class_desc, "smali");
-                    publish_class(claims, dirs, &dest, rank, &source, false)?;
-                }
-                Err(err) => {
-                    errors += 1;
-                    if options.debug {
-                        eprintln!("[APK] '{}' {class_desc} decompile error: {err}", entry.name);
-                    }
-                }
-            }
-        }
+        let job = DumpCtx {
+            label: &entry.name,
+            out_dir,
+            options,
+            claims,
+            dirs,
+            resources,
+        };
+        errors += dump_smali_image(buf, rank, &job)?;
     }
     if options.debug {
         eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
@@ -341,44 +338,101 @@ fn dump_dex_entry_ddc(
             tie: rank_base.3,
             logical: logical as u32,
         };
-        let image = crate::ddc_engine::Image::open(buf)?;
-        let names = image.top_level();
-        let class_errors = AtomicUsize::new(0);
-        run_indexed(names.len(), options.threads, |index| {
-            let internal = &names[index];
-            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                image.render(internal)
-            }));
-            match rendered {
-                Ok(Ok(source)) => {
-                    let rewritten = resources.rewrite_code(&source);
-                    let descriptor = crate::ddc_engine::internal_to_descriptor(internal);
-                    let dest = class_output_path(out_dir, &descriptor, "java");
-                    publish_class(claims, dirs, &dest, rank, rewritten.as_ref(), true)?;
-                    Ok(())
-                }
-                Ok(Err(err)) => {
-                    class_errors.fetch_add(1, Ordering::Relaxed);
-                    if options.debug {
-                        eprintln!("[APK] '{}' {internal} decompile error: {err}", entry.name);
-                    }
-                    Ok(())
-                }
-                Err(_) => {
-                    class_errors.fetch_add(1, Ordering::Relaxed);
-                    if options.debug {
-                        eprintln!("[APK] '{}' {internal} decompile panicked", entry.name);
-                    }
-                    Ok(())
-                }
-            }
-        })?;
-        errors += class_errors.load(Ordering::Relaxed);
+        let job = DumpCtx {
+            label: &entry.name,
+            out_dir,
+            options,
+            claims,
+            dirs,
+            resources,
+        };
+        errors += dump_ddc_image(buf, rank, &job)?;
     }
     if options.debug {
         eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
     }
     Ok(errors)
+}
+
+struct DumpCtx<'a> {
+    label: &'a str,
+    out_dir: &'a Path,
+    options: &'a Options,
+    claims: &'a Mutex<HashMap<PathBuf, ClassRank>>,
+    dirs: &'a Mutex<HashSet<PathBuf>>,
+    resources: &'a crate::arsc::ResourceTable,
+}
+
+fn dump_smali_image(buf: Vec<u8>, rank: ClassRank, job: &DumpCtx<'_>) -> Result<usize> {
+    let dex = Dex::parse(&buf)?;
+    let mut errors = 0usize;
+    for index in 0..dex.header.class_defs_size {
+        let def = dex.class_def(index)?;
+        let class_desc = match dex.type_desc(def.class_idx) {
+            Ok(desc) => desc,
+            Err(err) => {
+                errors += 1;
+                if job.options.debug {
+                    eprintln!(
+                        "[APK] '{}' class_idx={} type error: {err}",
+                        job.label, def.class_idx
+                    );
+                }
+                continue;
+            }
+        };
+        match smali_class_def(&dex, &def) {
+            Ok(source) => {
+                let dest = class_output_path(job.out_dir, &class_desc, "smali");
+                publish_class(job.claims, job.dirs, &dest, rank, &source, false)?;
+            }
+            Err(err) => {
+                errors += 1;
+                if job.options.debug {
+                    eprintln!(
+                        "[APK] '{}' {class_desc} decompile error: {err}",
+                        job.label
+                    );
+                }
+            }
+        }
+    }
+    Ok(errors)
+}
+
+fn dump_ddc_image(buf: Vec<u8>, rank: ClassRank, job: &DumpCtx<'_>) -> Result<usize> {
+    let image = crate::ddc_engine::Image::open(buf)?;
+    let names = image.top_level();
+    let class_errors = AtomicUsize::new(0);
+    run_indexed(names.len(), job.options.threads, |index| {
+        let internal = &names[index];
+        let rendered =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| image.render(internal)));
+        match rendered {
+            Ok(Ok(source)) => {
+                let rewritten = job.resources.rewrite_code(&source);
+                let descriptor = crate::ddc_engine::internal_to_descriptor(internal);
+                let dest = class_output_path(job.out_dir, &descriptor, "java");
+                publish_class(job.claims, job.dirs, &dest, rank, rewritten.as_ref(), true)?;
+                Ok(())
+            }
+            Ok(Err(err)) => {
+                class_errors.fetch_add(1, Ordering::Relaxed);
+                if job.options.debug {
+                    eprintln!("[APK] '{}' {internal} decompile error: {err}", job.label);
+                }
+                Ok(())
+            }
+            Err(_) => {
+                class_errors.fetch_add(1, Ordering::Relaxed);
+                if job.options.debug {
+                    eprintln!("[APK] '{}' {internal} decompile panicked", job.label);
+                }
+                Ok(())
+            }
+        }
+    })?;
+    Ok(class_errors.load(Ordering::Relaxed))
 }
 
 fn publish_class(
@@ -529,6 +583,10 @@ fn sanitize_part(part: &str) -> String {
 pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec<String>> {
     check_threads(options.threads)?;
     let started = Instant::now();
+    if let Some(data) = read_bare_dex(path)? {
+        return find_bare_dex(path, data, query, options);
+    }
+    reject_external_resources(options)?;
     let (_file, map) = open_apk(path)?;
     let mut entries = parse_cd_dex_entries(&map)?;
     entries.sort_by(|left, right| {
@@ -660,6 +718,180 @@ fn check_threads(threads: usize) -> Result<()> {
         bail!("Worker count must be greater than zero");
     }
     Ok(())
+}
+
+/// True when `path` is a standalone DEX image, not a ZIP container.
+pub fn is_dex(path: &Path) -> Result<bool> {
+    let mut file = File::open(path).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut magic = [0u8; 8];
+    let read = file.read(&mut magic).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(is_bare_dex_magic(&magic[..read]))
+}
+
+fn read_bare_dex(path: &Path) -> Result<Option<Vec<u8>>> {
+    if !is_dex(path)? {
+        return Ok(None);
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|source| Error::IoPath {
+            action: "open",
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+fn is_bare_dex_magic(magic: &[u8]) -> bool {
+    magic.len() >= 8
+        && magic.starts_with(b"dex\n")
+        && magic[4].is_ascii_digit()
+        && magic[5].is_ascii_digit()
+        && magic[6].is_ascii_digit()
+        && magic[7] == 0
+}
+
+fn reject_external_resources(options: &Options) -> Result<()> {
+    if options.resources.is_some() {
+        bail!("--resources is only used with a bare DEX or ABC file");
+    }
+    Ok(())
+}
+
+fn external_arsc(options: &Options) -> Result<crate::arsc::ResourceTable> {
+    let Some(path) = &options.resources else {
+        return Ok(crate::arsc::ResourceTable::default());
+    };
+    if !path.is_file() {
+        bail!("{} must be a resources.arsc file", path.display());
+    }
+    let bytes = fs::read(path).map_err(|source| Error::IoPath {
+        action: "open",
+        path: path.display().to_string(),
+        source,
+    })?;
+    crate::arsc::ResourceTable::parse(&bytes)
+        .map_err(|err| Error::new(format!("{}: {err}", path.display())))
+}
+
+fn dex_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("classes.dex")
+        .to_string()
+}
+
+fn list_bare_dex(
+    path: &Path,
+    data: Vec<u8>,
+    prefix: Option<&str>,
+    options: &Options,
+) -> Result<Vec<String>> {
+    let label = dex_label(path);
+    let mut names = Vec::new();
+    for (_name, buf) in logical_buffers(&label, data)? {
+        names.extend(Dex::parse(&buf)?.class_descriptors(prefix)?);
+    }
+    if options.debug {
+        eprintln!("[DEX] '{label}' class_count={}", names.len());
+    }
+    Ok(names)
+}
+
+fn class_source_dex(
+    path: &Path,
+    data: Vec<u8>,
+    descriptor: &str,
+    options: &Options,
+) -> Result<String> {
+    let label = dex_label(path);
+    let mut hit = None;
+    for (name, buf) in logical_buffers(&label, data)? {
+        if Dex::parse(&buf)?.find_class_def(descriptor)?.is_some() {
+            hit = Some(buf);
+            if options.debug {
+                eprintln!("[DEBUG] Hit DEX: {name}");
+            }
+            break;
+        }
+    }
+    let Some(dex_buf) = hit else {
+        bail!("Class {descriptor} not found in DEX.");
+    };
+    let text = match options.engine {
+        Engine::Smali => smali_class(&dex_buf, descriptor)?,
+        Engine::Ddc => crate::ddc_engine::decompile_one(dex_buf, descriptor)?,
+    };
+    if options.engine == Engine::Smali {
+        return Ok(text);
+    }
+    Ok(external_arsc(options)?.rewrite_code(&text).into_owned())
+}
+
+fn find_bare_dex(
+    path: &Path,
+    data: Vec<u8>,
+    query: &RefQuery,
+    options: &Options,
+) -> Result<Vec<String>> {
+    let resources = external_arsc(options)?;
+    let label = dex_label(path);
+    let mut lines = Vec::new();
+    for (name, buf) in logical_buffers(&label, data)? {
+        lines.extend(find_in_dex_resolved(&name, &buf, query, &|text| {
+            resources.rewrite_plain(text)
+        })?);
+    }
+    Ok(lines
+        .into_iter()
+        .map(|line| present_ref_line(&resources, query, &line))
+        .collect())
+}
+
+fn dump_bare_dex(
+    path: &Path,
+    data: Vec<u8>,
+    out_dir: &Path,
+    options: &Options,
+) -> Result<DumpStats> {
+    fs::create_dir_all(out_dir)?;
+    let resources = external_arsc(options)?;
+    let label = dex_label(path);
+    let buffers = logical_buffers(&label, data)?;
+    let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
+    let dirs = Mutex::new(HashSet::<PathBuf>::new());
+    let mut errors = 0usize;
+    for (index, (_name, buf)) in buffers.into_iter().enumerate() {
+        let rank = ClassRank {
+            module: 0,
+            kind: 0,
+            ordinal: 1,
+            tie: 0,
+            logical: index as u32,
+        };
+        let job = DumpCtx {
+            label: &label,
+            out_dir,
+            options,
+            claims: &claims,
+            dirs: &dirs,
+            resources: &resources,
+        };
+        errors += if options.engine == Engine::Ddc {
+            dump_ddc_image(buf, rank, &job)?
+        } else {
+            dump_smali_image(buf, rank, &job)?
+        };
+    }
+    let classes = claims.lock().expect("mutex poisoned").len();
+    Ok(DumpStats { classes, errors })
 }
 
 fn open_apk(path: &Path) -> Result<(File, Mmap)> {

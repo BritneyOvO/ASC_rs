@@ -2,8 +2,11 @@
 //! are replaced in `module.json`, `pack.info`, class text, and string literals.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 use crate::hap::{inflate, ZipEntry};
+use crate::{Error, Result};
 use memmap2::Mmap;
 
 struct Slot {
@@ -17,36 +20,74 @@ pub struct HapResources {
 }
 
 impl HapResources {
-    pub fn index(map: &Mmap, entries: &[ZipEntry]) -> Self {
+    pub(crate) fn index(map: &Mmap, entries: &[ZipEntry]) -> Self {
         let mut resources = Self::default();
         for entry in entries {
-            let Some((kind, name, base)) = resource_key(&entry.name) else {
+            let Some((kind, _, _)) = resource_key(&entry.name) else {
                 continue;
             };
-            let value = if kind == "profile" && entry.uncomp_size <= 8192 {
-                inflate(map, entry)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                    .unwrap_or_else(|_| entry.name.clone())
-            } else if kind == "media" || kind == "profile" {
-                entry.name.clone()
-            } else {
-                match inflate(map, entry) {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        for (item_name, item_value) in json_named_values(&text) {
-                            resources.insert(&kind, &item_name, item_value, base);
-                        }
-                        continue;
-                    }
-                    Err(err) => {
-                        eprintln!("warning: {}: {err}", entry.name);
-                        continue;
-                    }
-                }
-            };
-            resources.insert(&kind, &name, value, base);
+            if kind == "media" || (kind == "profile" && entry.uncomp_size > 8192) {
+                resources.add_file(&entry.name, b"");
+                continue;
+            }
+            match inflate(map, entry) {
+                Ok(bytes) => resources.add_file(&entry.name, &bytes),
+                Err(err) => eprintln!("warning: {}: {err}", entry.name),
+            }
         }
         resources
+    }
+
+    /// Reads a `resources/` tree, or a directory whose children are that tree.
+    pub(crate) fn from_dir(root: &Path) -> Result<Self> {
+        let mut resources = Self::default();
+        let prefix_resources = !root.join("resources").is_dir();
+        visit_resources(root, root, prefix_resources, &mut resources)?;
+        if resources.is_empty() {
+            bail!("no Harmony resources in {}", root.display());
+        }
+        Ok(resources)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Resolved text when `$string:`, `$media:`, or `$profile:` changed.
+    pub fn resolve_literal(&self, bytes: &[u8]) -> Option<String> {
+        if self.values.is_empty() || !bytes.contains(&b'$') {
+            return None;
+        }
+        let shown = String::from_utf8_lossy(bytes);
+        let resolved = self.annotate(shown.as_ref());
+        if resolved.as_ref() == shown.as_ref() {
+            None
+        } else {
+            Some(resolved.into_owned())
+        }
+    }
+
+    fn add_file(&mut self, entry_name: &str, bytes: &[u8]) {
+        let Some((kind, name, base)) = resource_key(entry_name) else {
+            return;
+        };
+        if kind == "profile" && !bytes.is_empty() && bytes.len() <= 8192 {
+            self.insert(
+                &kind,
+                &name,
+                String::from_utf8_lossy(bytes).into_owned(),
+                base,
+            );
+            return;
+        }
+        if kind == "media" || kind == "profile" {
+            self.insert(&kind, &name, entry_name.to_string(), base);
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        for (item_name, item_value) in json_named_values(&text) {
+            self.insert(&kind, &item_name, item_value, base);
+        }
     }
 
     pub fn annotate<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
@@ -92,6 +133,47 @@ impl HapResources {
             }
         }
     }
+}
+
+fn visit_resources(
+    root: &Path,
+    dir: &Path,
+    prefix_resources: bool,
+    resources: &mut HapResources,
+) -> Result<()> {
+    let entries = fs::read_dir(dir).map_err(|source| Error::IoPath {
+        action: "open",
+        path: dir.display().to_string(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| Error::IoPath {
+            action: "open",
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            visit_resources(root, &path, prefix_resources, resources)?;
+            continue;
+        }
+        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let mut name = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        if prefix_resources {
+            name = format!("resources/{name}");
+        }
+        let bytes = fs::read(&path).map_err(|source| Error::IoPath {
+            action: "open",
+            path: path.display().to_string(),
+            source,
+        })?;
+        resources.add_file(&name, &bytes);
+    }
+    Ok(())
 }
 
 fn resource_key(path: &str) -> Option<(String, String, bool)> {

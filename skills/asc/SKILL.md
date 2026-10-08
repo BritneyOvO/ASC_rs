@@ -1,6 +1,6 @@
 ---
 name: asc
-description: Inspect a user-provided Android APK, AAB, HAP, or ABC with the asc command. Use to decompile one known class, list classes under a package prefix, decode AndroidManifest or a HAP module config, or find bytecode references to a string, type, method, or field. Do not use for whole-package export, package modification, signing, or installation unless the user explicitly asks to dump every class.
+description: Inspect a user-provided Android APK, AAB, bare DEX, HAP, or ABC with the asc command. Use to decompile one known class, list classes under a package prefix, decode AndroidManifest or a HAP module config, or find bytecode references to a string, type, method, or field. Do not use for whole-package export, package modification, signing, or installation unless the user explicitly asks to dump every class.
 when-to-use: APK analysis, decompile one class, asc getclass, list classes, asc listclass, find references, asc findrefs, AndroidManifest, getmanifest, HAP module.json, ABC class
 ---
 
@@ -31,8 +31,9 @@ for exact syntax and query semantics.
 
 ## Choose the decompiler deliberately
 
-`--engine` applies only to APK and AAB `getclass` and `dump`. HAP and ABC
-ignore it.
+`--engine` applies to APK, AAB, and bare DEX `getclass` and `dump`. HAP and ABC
+ignore it. A bare DEX or ABC does not resolve resource values unless the user
+passes `--resources`. Do not invent a resource path.
 
 - Keep `ddc` (the default) when readable Java with reconstructed control flow
   is enough.

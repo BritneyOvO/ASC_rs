@@ -10,6 +10,7 @@ mod resources;
 
 pub use error::{Error, Result};
 pub use hap::{
-    dump_hap, find_refs, get_class_source, is_hap, list_classes, module_json, DumpStats, Options,
-    Query,
+    dump_abc, dump_hap, find_refs, get_class_source, is_hap, list_classes, load_resources,
+    module_json, DumpStats, Options, Query,
 };
+pub use resources::HapResources;

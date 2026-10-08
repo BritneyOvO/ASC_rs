@@ -13,6 +13,7 @@ fn opts(threads: usize) -> Options {
         threads,
         debug: false,
         engine: Engine::Ddc,
+        resources: None,
     }
 }
 
@@ -21,6 +22,7 @@ fn smali_opts(threads: usize) -> Options {
         threads,
         debug: false,
         engine: Engine::Smali,
+        resources: None,
     }
 }
 
@@ -700,6 +702,56 @@ fn ddc_getclass_rewrites_string_resources() {
     let source = get_class_source(&apk, "example.Test", &opts(2)).unwrap();
     assert!(source.contains("Hello"), "{source}");
     assert!(!source.contains("@string/app_name"), "{source}");
+    let mut rejected = opts(2);
+    rejected.resources = Some(dir.join("resources.arsc"));
+    let err = get_class_source(&apk, "example.Test", &rejected).unwrap_err();
+    assert!(err.to_string().contains("bare DEX or ABC"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bare_dex_resolves_resources_only_when_arsc_is_given() {
+    let dex = support::make_return_string_dex(b"@string/app_name");
+    let dir = std::env::temp_dir().join(format!("asc-bare-dex-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dex_path = dir.join("classes.dex");
+    std::fs::write(&dex_path, &dex).unwrap();
+    let plain = get_class_source(&dex_path, "example.Test", &opts(2)).unwrap();
+    assert!(plain.contains("@string/app_name"), "{plain}");
+    assert!(!plain.contains("Hello"), "{plain}");
+    let names = list_classes(&dex_path, Some("Lexample/Test"), &opts(2)).unwrap();
+    assert_eq!(names, vec!["Lexample/Test;".to_string()]);
+    let raw = find_refs(
+        &dex_path,
+        &RefQuery::String("Hello".into()),
+        &opts(2),
+    )
+    .unwrap();
+    assert!(raw.is_empty(), "{raw:?}");
+
+    let arsc = dir.join("resources.arsc");
+    std::fs::write(&arsc, hello_arsc()).unwrap();
+    let mut with = opts(2);
+    with.resources = Some(arsc);
+    let rewritten = get_class_source(&dex_path, "example.Test", &with).unwrap();
+    assert!(rewritten.contains("Hello"), "{rewritten}");
+    assert!(!rewritten.contains("@string/app_name"), "{rewritten}");
+    let resolved = find_refs(
+        &dex_path,
+        &RefQuery::String("Hello".into()),
+        &with,
+    )
+    .unwrap();
+    assert!(
+        resolved.iter().any(|line| line.contains("Hello")),
+        "{resolved:?}"
+    );
+    let out = dir.join("out");
+    let stats = dump_apk(&dex_path, &out, &with).unwrap();
+    assert_eq!(stats.classes, 1);
+    assert_eq!(stats.errors, 0);
+    let dumped = std::fs::read_to_string(out.join("example/Test.java")).unwrap();
+    assert!(dumped.contains("Hello"), "{dumped}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
