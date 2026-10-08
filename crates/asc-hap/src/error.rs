@@ -14,6 +14,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Abc(#[from] asc_abc::Error),
+    /// The file has no ZIP end-of-central-directory record.
+    #[error("EOCD not found")]
+    NoEocd,
     #[error("{0}")]
     Message(String),
 }

@@ -14,6 +14,7 @@ fn opts(threads: usize) -> Options {
         debug: false,
         engine: Engine::Ddc,
         resources: None,
+        cache_dir: None,
     }
 }
 
@@ -23,6 +24,7 @@ fn smali_opts(threads: usize) -> Options {
         debug: false,
         engine: Engine::Smali,
         resources: None,
+        cache_dir: None,
     }
 }
 
@@ -620,7 +622,9 @@ fn aab_duplicate_class_prefers_base_then_classes_ordinal() {
     let source = get_class_source(&aab, "example.Test", &smali_opts(4)).unwrap();
     assert!(source.contains("from-base-module!"), "{source}");
     assert!(!source.contains("from-feature-mod"), "{source}");
-    let lines = find_refs(&aab, &RefQuery::String("from-feature-mod".into()), &opts(2)).unwrap();
+    let lines = find_refs(&aab, &RefQuery::String("from-feature-mod".into()), &opts(2))
+        .unwrap()
+        .lines;
     assert!(
         lines.iter().any(|line| line.contains("from-feature-mod")),
         "{lines:?}"
@@ -726,13 +730,14 @@ fn bare_dex_resolves_resources_only_when_arsc_is_given() {
         &RefQuery::String("Hello".into()),
         &opts(2),
     )
-    .unwrap();
+    .unwrap()
+    .lines;
     assert!(raw.is_empty(), "{raw:?}");
 
     let arsc = dir.join("resources.arsc");
     std::fs::write(&arsc, hello_arsc()).unwrap();
     let mut with = opts(2);
-    with.resources = Some(arsc);
+    with.resources = Some(arsc.clone());
     let rewritten = get_class_source(&dex_path, "example.Test", &with).unwrap();
     assert!(rewritten.contains("Hello"), "{rewritten}");
     assert!(!rewritten.contains("@string/app_name"), "{rewritten}");
@@ -741,7 +746,8 @@ fn bare_dex_resolves_resources_only_when_arsc_is_given() {
         &RefQuery::String("Hello".into()),
         &with,
     )
-    .unwrap();
+    .unwrap()
+    .lines;
     assert!(
         resolved.iter().any(|line| line.contains("Hello")),
         "{resolved:?}"
@@ -752,6 +758,72 @@ fn bare_dex_resolves_resources_only_when_arsc_is_given() {
     assert_eq!(stats.errors, 0);
     let dumped = std::fs::read_to_string(out.join("example/Test.java")).unwrap();
     assert!(dumped.contains("Hello"), "{dumped}");
+    let mut smali = smali_opts(2);
+    smali.resources = Some(dir.join("missing.arsc"));
+    let err = get_class_source(&dex_path, "example.Test", &smali).unwrap_err();
+    assert!(err.to_string().contains("missing.arsc"), "{err}");
+    smali.resources = Some(arsc);
+    let smali_text = get_class_source(&dex_path, "example.Test", &smali).unwrap();
+    assert!(smali_text.contains("@string/app_name"), "{smali_text}");
+    assert!(!smali_text.contains("Hello"), "{smali_text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_broken_dex_entry_keeps_the_other_hits_and_exits_2() {
+    let dir = std::env::temp_dir().join(format!("asc-partial-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apk = write_apk(
+        &dir,
+        "partial.apk",
+        &[
+            ("classes.dex", support::make_dex().as_slice()),
+            ("classes2.dex", b"dex\n035\0not-a-dex"),
+        ],
+        false,
+    );
+    let report = find_refs(&apk, &RefQuery::String("token".into()), &opts(2)).unwrap();
+    assert!(report.partial, "{:?}", report.lines);
+    assert!(report.lines.iter().any(|line| line.contains("token")), "{:?}", report.lines);
+    let output = Command::new(env!("CARGO_BIN_EXE_asc"))
+        .args([
+            "findrefs",
+            "--no-cache",
+            apk.to_str().unwrap(),
+            "string",
+            "token",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("token"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fuzzy_class_is_rejected_for_a_bare_abc() {
+    let dir = std::env::temp_dir().join(format!("asc-fuzzy-abc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let abc = dir.join("modules.abc");
+    let mut bytes = b"PANDA\0\0\0".to_vec();
+    bytes.resize(64, 0);
+    std::fs::write(&abc, bytes).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_asc"))
+        .args([
+            "findrefs",
+            abc.to_str().unwrap(),
+            "method",
+            "main",
+            "--class",
+            "demo.App",
+            "--fuzzy-class",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--fuzzy-class"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

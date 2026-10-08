@@ -10,7 +10,9 @@ use flate2::read::DeflateDecoder;
 use memmap2::Mmap;
 
 use crate::{Error, Result};
-use asc_abc::{class_names, class_text_optional, find_members, find_strings_resolved, find_types};
+use asc_abc::{
+    class_names, class_text_optional, find_members, find_strings_resolved, find_types, MemberKind,
+};
 
 /// Ceiling on one inflated ZIP entry. A real `.abc` stays far below it, and a
 /// crafted entry can never make the reader allocate without bound.
@@ -53,11 +55,7 @@ pub(crate) struct ZipEntry {
 }
 
 pub fn is_hap(path: &Path) -> Result<bool> {
-    let (_file, map) = match open_hap(path) {
-        Ok(opened) => opened,
-        Err(Error::Message(message)) if message.contains("EOCD") => return Ok(false),
-        Err(err) => return Err(err),
-    };
+    let (_file, map) = open_hap(path)?;
     // A directory this reader cannot walk is not a HAP it can use; the APK path
     // reports the damage.
     let Ok(entries) = zip_entries(&map) else {
@@ -169,10 +167,24 @@ pub fn find_refs(path: &Path, query: Query<'_>, options: &Options) -> Result<Vec
             find_types(bytes, name, pattern).map_err(Error::from)
         })?,
         Query::Method { name, class_name } => scan_code(&map, stored, options, |entry, bytes| {
-            find_members(bytes, entry, true, name.unwrap_or(".*"), class_name).map_err(Error::from)
+            find_members(
+                bytes,
+                entry,
+                MemberKind::Method,
+                name.unwrap_or(".*"),
+                class_name,
+            )
+            .map_err(Error::from)
         })?,
         Query::Field { name, class_name } => scan_code(&map, stored, options, |entry, bytes| {
-            find_members(bytes, entry, false, name.unwrap_or(".*"), class_name).map_err(Error::from)
+            find_members(
+                bytes,
+                entry,
+                MemberKind::Field,
+                name.unwrap_or(".*"),
+                class_name,
+            )
+            .map_err(Error::from)
         })?,
     };
     let mut lines = Vec::new();
@@ -225,9 +237,10 @@ pub fn load_resources(path: &Path) -> Result<crate::resources::HapResources> {
     if path.is_dir() {
         return crate::resources::HapResources::from_dir(path);
     }
-    let opened = match open_hap(path) {
-        Ok(opened) => opened,
-        Err(Error::Message(message)) if message.contains("EOCD") => {
+    let (_file, map) = open_hap(path)?;
+    let entries = match zip_entries(&map) {
+        Ok(entries) => entries,
+        Err(Error::NoEocd) => {
             bail!(
                 "{} is not a Harmony resource directory or HAP",
                 path.display()
@@ -235,8 +248,6 @@ pub fn load_resources(path: &Path) -> Result<crate::resources::HapResources> {
         }
         Err(err) => return Err(err),
     };
-    let (_file, map) = opened;
-    let entries = zip_entries(&map)?;
     let resources = crate::resources::HapResources::index(&map, &entries);
     if resources.is_empty() {
         bail!("{} contains no Harmony resources", path.display());
@@ -706,7 +717,7 @@ fn zip_entries(data: &[u8]) -> Result<Vec<ZipEntry>> {
 }
 
 fn cd_bounds(data: &[u8]) -> Result<(usize, usize)> {
-    let eocd = find_eocd(data).ok_or_else(|| Error::new("EOCD not found"))?;
+    let eocd = find_eocd(data).ok_or(Error::NoEocd)?;
     let cd_size_32 = u32_at(data, eocd + 12)?;
     let cd_off_32 = u32_at(data, eocd + 16)?;
     let (cd_off, cd_size) = if cd_size_32 == u32::MAX || cd_off_32 == u32::MAX {

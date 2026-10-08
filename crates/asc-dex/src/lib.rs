@@ -8,6 +8,7 @@ mod error;
 pub mod bytes;
 pub mod dex;
 pub mod findrefs;
+pub mod quick;
 mod opcodes;
 mod smali;
 

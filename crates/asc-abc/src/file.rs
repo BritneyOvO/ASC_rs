@@ -173,10 +173,11 @@ impl<'a> Abc<'a> {
     pub fn find_members(
         &self,
         file: &str,
-        methods: bool,
+        kind: MemberKind,
         pattern: &str,
         class_name: Option<&str>,
     ) -> Result<Vec<String>> {
+        let methods = kind.selects_methods();
         let regex = byte_regex(pattern, true)?;
         let mut lines = Vec::new();
         let indexes: Vec<u32> = if let Some(class_name) = class_name {
@@ -926,14 +927,30 @@ pub fn find_types(data: &[u8], file: &str, pattern: &str) -> Result<Vec<String>>
     Abc::parse(data)?.find_types(file, pattern)
 }
 
+/// Which member table `find_members` searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberKind {
+    Method,
+    Field,
+}
+
+impl MemberKind {
+    fn selects_methods(self) -> bool {
+        match self {
+            Self::Method => true,
+            Self::Field => false,
+        }
+    }
+}
+
 pub fn find_members(
     data: &[u8],
     file: &str,
-    methods: bool,
+    kind: MemberKind,
     pattern: &str,
     class_name: Option<&str>,
 ) -> Result<Vec<String>> {
-    Abc::parse(data)?.find_members(file, methods, pattern, class_name)
+    Abc::parse(data)?.find_members(file, kind, pattern, class_name)
 }
 
 #[cfg(test)]
@@ -1183,7 +1200,14 @@ mod tests {
             resolved,
             vec!["app.abc | literal#0 | matched=(Hello)".to_string()]
         );
-        let methods = find_members(&data, "app.abc", true, "main", Some("Ldemo/App;")).unwrap();
+        let methods = find_members(
+            &data,
+            "app.abc",
+            super::MemberKind::Method,
+            "main",
+            Some("Ldemo/App;"),
+        )
+        .unwrap();
         assert_eq!(methods, vec!["app.abc | Ldemo/App;->main".to_string()]);
     }
 

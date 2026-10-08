@@ -16,6 +16,17 @@ pub enum Error {
     Dex(#[from] asc_dex::Error),
     #[error(transparent)]
     Manifest(#[from] asc_axml::Error),
+    /// The file has no ZIP end-of-central-directory record.
+    #[error("EOCD not found")]
+    NoEocd,
+    #[error("{context}: {source}")]
+    Context {
+        context: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error(transparent)]
+    External(Box<dyn std::error::Error + Send + Sync>),
     #[error("{0}")]
     Message(String),
 }
@@ -23,6 +34,20 @@ pub enum Error {
 impl Error {
     pub fn new(msg: impl Into<String>) -> Self {
         Self::Message(msg.into())
+    }
+
+    pub fn context(
+        context: impl Into<String>,
+        err: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Context {
+            context: context.into(),
+            source: Box::new(err),
+        }
+    }
+
+    pub fn external(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::External(Box::new(err))
     }
 }
 

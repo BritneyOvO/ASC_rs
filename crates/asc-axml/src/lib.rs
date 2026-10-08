@@ -2,6 +2,8 @@
 
 #[macro_use]
 mod error;
+
+mod attrs;
 mod bytes;
 
 pub use error::{Error, Result};
@@ -33,6 +35,7 @@ fn binary_manifest_xml(data: &[u8]) -> Result<String> {
     let limit = file_size.min(data.len());
     let mut pos = header_size.max(8);
     let mut pool = Vec::new();
+    let mut resource_ids = Vec::new();
     let mut roots = Vec::new();
     let mut stack: Vec<Node> = Vec::new();
     let mut namespaces: Vec<(String, String)> = Vec::new();
@@ -47,6 +50,7 @@ fn binary_manifest_xml(data: &[u8]) -> Result<String> {
         let chunk = &data[pos..pos + size];
         match kind {
             0x0001 => pool = parse_string_pool(chunk)?,
+            0x0180 => resource_ids = parse_resource_map(chunk),
             0x0100 => {
                 let (prefix, uri) = read_namespace(chunk, &pool)?;
                 namespaces.push((prefix.clone(), uri.clone()));
@@ -59,7 +63,7 @@ fn binary_manifest_xml(data: &[u8]) -> Result<String> {
                 if stack.len() >= MAX_DEPTH {
                     bail!("AndroidManifest.xml is nested too deeply");
                 }
-                let mut node = read_element(chunk, &pool, &namespaces)?;
+                let mut node = read_element(chunk, &pool, &namespaces, &resource_ids)?;
                 for (prefix, uri) in pending_ns.drain(..) {
                     let key = if prefix.is_empty() {
                         "xmlns".to_string()
@@ -218,7 +222,40 @@ fn read_namespace(chunk: &[u8], pool: &[String]) -> Result<(String, String)> {
     ))
 }
 
-fn read_element(chunk: &[u8], pool: &[String], namespaces: &[(String, String)]) -> Result<Node> {
+fn parse_resource_map(chunk: &[u8]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut at = 8usize;
+    while at + 4 <= chunk.len() {
+        ids.push(u32_at(chunk, at).unwrap_or(0));
+        at += 4;
+    }
+    ids
+}
+
+fn attr_local_name(pool: &[String], name_idx: u32, resource_ids: &[u32]) -> String {
+    let pool_name = pool_get(pool, name_idx);
+    let Some(index) = usize::try_from(name_idx).ok() else {
+        return pool_name;
+    };
+    let Some(&rid) = resource_ids.get(index) else {
+        return pool_name;
+    };
+    if let Some(name) = attrs::android_attr_name(rid) {
+        return name.to_string();
+    }
+    if pool_name.is_empty() {
+        format!("attr_0x{rid:08x}")
+    } else {
+        pool_name
+    }
+}
+
+fn read_element(
+    chunk: &[u8],
+    pool: &[String],
+    namespaces: &[(String, String)],
+    resource_ids: &[u32],
+) -> Result<Node> {
     if chunk.len() < 36 {
         bail!("truncated xml element");
     }
@@ -246,8 +283,9 @@ fn read_element(chunk: &[u8], pool: &[String], namespaces: &[(String, String)]) 
         let raw = u32_at(chunk, at + 8)?;
         let data_type = chunk[at + 15];
         let data = u32_at(chunk, at + 16)?;
+        let local = attr_local_name(pool, aname, resource_ids);
         node.attrs.push((
-            qualified(pool, ans, aname, namespaces),
+            qualify_local(pool, ans, &local, namespaces),
             attr_value(pool, raw, data_type, data),
         ));
     }
@@ -265,10 +303,14 @@ fn read_cdata(chunk: &[u8], pool: &[String]) -> Option<String> {
     Some(pool_get(pool, raw))
 }
 
-fn qualified(pool: &[String], ns: u32, name: u32, namespaces: &[(String, String)]) -> String {
-    let local = pool_get(pool, name);
+fn qualify_local(
+    pool: &[String],
+    ns: u32,
+    local: &str,
+    namespaces: &[(String, String)],
+) -> String {
     if ns == 0xffff_ffff {
-        return local;
+        return local.to_string();
     }
     let uri = pool_get(pool, ns);
     let prefix = namespaces
@@ -278,10 +320,15 @@ fn qualified(pool: &[String], ns: u32, name: u32, namespaces: &[(String, String)
         .map(|(prefix, _)| prefix.as_str())
         .unwrap_or("ns");
     if prefix.is_empty() {
-        local
+        local.to_string()
     } else {
         format!("{prefix}:{local}")
     }
+}
+
+fn qualified(pool: &[String], ns: u32, name: u32, namespaces: &[(String, String)]) -> String {
+    let local = pool_get(pool, name);
+    qualify_local(pool, ns, &local, namespaces)
 }
 
 fn attr_value(pool: &[String], raw: u32, data_type: u8, data: u32) -> String {
@@ -900,6 +947,30 @@ mod tests {
             xml.contains("xmlns:android=\"http://schemas.android.com/apk/res/android\""),
             "{xml}"
         );
+    }
+
+    #[test]
+    fn an_obfuscated_framework_attribute_uses_its_resource_id() {
+        assert_eq!(super::attrs::android_attr_name(0x0101_0003), Some("name"));
+        let strings = ["manifest", "a"];
+        let mut body = encode_pool(&strings);
+        let mut map = Vec::new();
+        push_u16(&mut map, 0x0180);
+        push_u16(&mut map, 8);
+        push_u32(&mut map, 16);
+        push_u32(&mut map, 0);
+        push_u32(&mut map, 0x0101_0003);
+        body.extend(map);
+        body.extend(element(0xffff_ffff, 0, &[(0xffff_ffff, 1, 1)]));
+        body.extend(end_element(0xffff_ffff, 0));
+        let mut file = Vec::new();
+        push_u16(&mut file, 0x0003);
+        push_u16(&mut file, 8);
+        push_u32(&mut file, (8 + body.len()) as u32);
+        file.extend(body);
+        let xml = manifest_xml(&file).unwrap();
+        assert!(xml.contains("name=\"a\""), "{xml}");
+        assert!(!xml.contains("a=\"a\""), "{xml}");
     }
 
     fn cdata(raw: u32) -> Vec<u8> {

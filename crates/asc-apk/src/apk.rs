@@ -22,6 +22,9 @@ use asc_dex::{
     Dex, RefQuery,
 };
 
+#[path = "bare.rs"]
+mod bare;
+
 /// Ceiling on one inflated ZIP entry. A real DEX stays far below it, and a
 /// crafted entry can never make the reader allocate without bound.
 const MAX_INFLATED_BYTES: u64 = 1 << 30;
@@ -45,6 +48,8 @@ pub struct Options {
     /// keep using the table stored in the package. `None` leaves a bare DEX
     /// unresolved.
     pub resources: Option<PathBuf>,
+    /// Directory for inflated DEX entries. `None` does not read or write a cache.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -54,6 +59,7 @@ impl Default for Options {
             debug: false,
             engine: Engine::Ddc,
             resources: None,
+            cache_dir: None,
         }
     }
 }
@@ -99,12 +105,13 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
         Some(value) => Some(normalize_prefix(value)?),
         None => None,
     };
-    if let Some(data) = read_bare_dex(path)? {
-        return list_bare_dex(path, data, prefix.as_deref(), options);
+    if let Some(mapped) = bare::open(path)? {
+        return bare::list_classes(path, mapped.bytes(), prefix.as_deref(), options);
     }
     reject_external_resources(options)?;
     let started = Instant::now();
     let (_file, map) = open_apk(path)?;
+    let cache = open_cache(path, &map, options);
     let entries = parse_cd_dex_entries(&map)?;
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -112,7 +119,7 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
     let prefix_ref = prefix.as_deref();
     let names = run_indexed(entries.len(), options.threads, |index| {
         let entry = &entries[index];
-        let data = inflate_dex(&map, entry)?;
+        let data = inflate_dex(&map, entry, cache.as_ref())?;
         let mut names = Vec::new();
         for (_name, buf) in logical_buffers(&entry.name, data)? {
             let dex = Dex::parse(&buf)?;
@@ -123,6 +130,9 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
         }
         Ok(names)
     })?;
+    if let Some(cache) = &cache {
+        cache.disk.evict();
+    }
     let mut flat = Vec::new();
     for group in names {
         flat.extend(group);
@@ -141,12 +151,13 @@ pub fn list_classes(path: &Path, prefix: Option<&str>, options: &Options) -> Res
 pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Result<String> {
     check_threads(options.threads)?;
     let descriptor = normalize_dalvik_class(class_name)?;
-    if let Some(data) = read_bare_dex(path)? {
-        return class_source_dex(path, data, &descriptor, options);
+    if let Some(mapped) = bare::open(path)? {
+        return bare::class_source(path, mapped.bytes(), &descriptor, options);
     }
     reject_external_resources(options)?;
     let started = Instant::now();
     let (_file, map) = open_apk(path)?;
+    let cache = open_cache(path, &map, options);
     let mut entries = parse_cd_dex_entries(&map)?;
     sort_by_load_order(&mut entries);
     if options.debug {
@@ -158,9 +169,12 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
     }
     let (hit, resources) = std::thread::scope(|scope| {
         let load = scope.spawn(|| load_resource_table(&map));
-        let hit = find_defining_dex(&map, &entries, descriptor.as_bytes(), options);
+        let hit = find_defining_dex(&map, &entries, descriptor.as_bytes(), options, cache.as_ref());
         (hit, load.join().expect("resource table loader panicked"))
     });
+    if let Some(cache) = &cache {
+        cache.disk.evict();
+    }
     let Some((dex_name, dex_buf)) = hit? else {
         bail!("Class {descriptor} not found in APK.");
     };
@@ -191,12 +205,13 @@ pub fn get_class_source(path: &Path, class_name: &str, options: &Options) -> Res
 pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpStats> {
     check_threads(options.threads)?;
     let started = Instant::now();
-    if let Some(data) = read_bare_dex(path)? {
-        return dump_bare_dex(path, data, out_dir, options);
+    if let Some(mapped) = bare::open(path)? {
+        return bare::dump(path, mapped.bytes(), out_dir, options);
     }
     reject_external_resources(options)?;
     fs::create_dir_all(out_dir)?;
     let (_file, map) = open_apk(path)?;
+    let cache = open_cache(path, &map, options);
     let resources = load_resource_table(&map);
     let xml = manifest_text(&map, &resources)?;
     fs::write(out_dir.join("AndroidManifest.xml"), xml)?;
@@ -206,23 +221,38 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     }
     if options.engine == Engine::Ddc {
         sort_by_load_order(&mut entries);
-        return dump_with_ddc(&map, &entries, out_dir, options, &resources, started);
+        let stats = dump_with_ddc(
+            &map,
+            &entries,
+            out_dir,
+            options,
+            &resources,
+            cache.as_ref(),
+            started,
+        )?;
+        if let Some(cache) = &cache {
+            cache.disk.evict();
+        }
+        return Ok(stats);
     }
     let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
     let dirs = Mutex::new(HashSet::<PathBuf>::new());
+    let archive = ArchiveDump {
+        apk: &map,
+        out_dir,
+        options,
+        claims: &claims,
+        dirs: &dirs,
+        resources: &resources,
+        cache: cache.as_ref(),
+    };
     let errors = run_indexed(entries.len(), options.threads, |index| {
-        dump_dex_entry(
-            &map,
-            &entries[index],
-            out_dir,
-            options,
-            ranks[index],
-            &claims,
-            &dirs,
-            &resources,
-        )
+        dump_dex_entry(&archive, &entries[index], ranks[index])
     })?;
+    if let Some(cache) = &cache {
+        cache.disk.evict();
+    }
     let total = DumpStats {
         classes: claims.lock().expect("mutex poisoned").len(),
         errors: errors.into_iter().sum(),
@@ -239,17 +269,22 @@ pub fn dump_apk(path: &Path, out_dir: &Path, options: &Options) -> Result<DumpSt
     Ok(total)
 }
 
+struct ArchiveDump<'a> {
+    apk: &'a [u8],
+    out_dir: &'a Path,
+    options: &'a Options,
+    claims: &'a Mutex<HashMap<PathBuf, ClassRank>>,
+    dirs: &'a Mutex<HashSet<PathBuf>>,
+    resources: &'a crate::arsc::ResourceTable,
+    cache: Option<&'a LoadedCache>,
+}
+
 fn dump_dex_entry(
-    apk: &[u8],
+    archive: &ArchiveDump<'_>,
     entry: &DexEntry,
-    out_dir: &Path,
-    options: &Options,
     rank_base: (u8, u8, u32, u32),
-    claims: &Mutex<HashMap<PathBuf, ClassRank>>,
-    dirs: &Mutex<HashSet<PathBuf>>,
-    resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
-    let data = inflate_dex(apk, entry)?;
+    let data = inflate_dex(archive.apk, entry, archive.cache)?;
     let mut errors = 0usize;
     for (logical, (_name, buf)) in logical_buffers(&entry.name, data)?.into_iter().enumerate() {
         let rank = ClassRank {
@@ -257,19 +292,20 @@ fn dump_dex_entry(
             kind: rank_base.1,
             ordinal: rank_base.2,
             tie: rank_base.3,
-            logical: logical as u32,
+            logical: u32::try_from(logical)
+                .map_err(|_| Error::new("too many DEX images in one entry"))?,
         };
         let job = DumpCtx {
             label: &entry.name,
-            out_dir,
-            options,
-            claims,
-            dirs,
-            resources,
+            out_dir: archive.out_dir,
+            options: archive.options,
+            claims: archive.claims,
+            dirs: archive.dirs,
+            resources: archive.resources,
         };
         errors += dump_smali_image(buf, rank, &job)?;
     }
-    if options.debug {
+    if archive.options.debug {
         eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
     }
     Ok(errors)
@@ -281,26 +317,27 @@ fn dump_with_ddc(
     out_dir: &Path,
     options: &Options,
     resources: &crate::arsc::ResourceTable,
+    cache: Option<&LoadedCache>,
     started: Instant,
 ) -> Result<DumpStats> {
     let ranks: Vec<(u8, u8, u32, u32)> = entries.iter().map(load_key).collect();
     let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
     let dirs = Mutex::new(HashSet::<PathBuf>::new());
+    let archive = ArchiveDump {
+        apk,
+        out_dir,
+        options,
+        claims: &claims,
+        dirs: &dirs,
+        resources,
+        cache,
+    };
     // One DEX image at a time. The thread budget decompiles classes inside
     // that image, so a large classesN.dex does not run single-threaded
     // while the other workers sit idle.
     let mut errors = 0usize;
     for (index, entry) in entries.iter().enumerate() {
-        errors += dump_dex_entry_ddc(
-            apk,
-            entry,
-            out_dir,
-            options,
-            ranks[index],
-            &claims,
-            &dirs,
-            resources,
-        )?;
+        errors += dump_dex_entry_ddc(&archive, entry, ranks[index])?;
     }
     let total = DumpStats {
         classes: claims.lock().expect("mutex poisoned").len(),
@@ -319,16 +356,11 @@ fn dump_with_ddc(
 }
 
 fn dump_dex_entry_ddc(
-    apk: &[u8],
+    archive: &ArchiveDump<'_>,
     entry: &DexEntry,
-    out_dir: &Path,
-    options: &Options,
     rank_base: (u8, u8, u32, u32),
-    claims: &Mutex<HashMap<PathBuf, ClassRank>>,
-    dirs: &Mutex<HashSet<PathBuf>>,
-    resources: &crate::arsc::ResourceTable,
 ) -> Result<usize> {
-    let data = inflate_dex(apk, entry)?;
+    let data = inflate_dex(archive.apk, entry, archive.cache)?;
     let mut errors = 0usize;
     for (logical, (_name, buf)) in logical_buffers(&entry.name, data)?.into_iter().enumerate() {
         let rank = ClassRank {
@@ -336,19 +368,20 @@ fn dump_dex_entry_ddc(
             kind: rank_base.1,
             ordinal: rank_base.2,
             tie: rank_base.3,
-            logical: logical as u32,
+            logical: u32::try_from(logical)
+                .map_err(|_| Error::new("too many DEX images in one entry"))?,
         };
         let job = DumpCtx {
             label: &entry.name,
-            out_dir,
-            options,
-            claims,
-            dirs,
-            resources,
+            out_dir: archive.out_dir,
+            options: archive.options,
+            claims: archive.claims,
+            dirs: archive.dirs,
+            resources: archive.resources,
         };
         errors += dump_ddc_image(buf, rank, &job)?;
     }
-    if options.debug {
+    if archive.options.debug {
         eprintln!("[APK] '{}' decompile errors={errors}", entry.name);
     }
     Ok(errors)
@@ -580,18 +613,31 @@ fn sanitize_part(part: &str) -> String {
     format!("{safe}~{hash:08x}")
 }
 
-pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec<String>> {
+/// Reference hits, plus whether any DEX entry could not be searched.
+#[derive(Clone, Debug, Default)]
+pub struct RefReport {
+    pub lines: Vec<String>,
+    pub partial: bool,
+}
+
+pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<RefReport> {
     check_threads(options.threads)?;
     let started = Instant::now();
-    if let Some(data) = read_bare_dex(path)? {
-        return find_bare_dex(path, data, query, options);
+    if let Some(mapped) = bare::open(path)? {
+        return Ok(RefReport {
+            lines: bare::find_refs(path, mapped.bytes(), query, options)?,
+            partial: false,
+        });
     }
     reject_external_resources(options)?;
     let (_file, map) = open_apk(path)?;
+    let cache = open_cache(path, &map, options);
     let mut entries = parse_cd_dex_entries(&map)?;
+    // The largest member dominates inflate time, so start it first.
     entries.sort_by(|left, right| {
-        left.comp_size
-            .cmp(&right.comp_size)
+        right
+            .comp_size
+            .cmp(&left.comp_size)
             .then(left.name.cmp(&right.name))
             .then(left.local_header_off.cmp(&right.local_header_off))
     });
@@ -599,13 +645,31 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
     let groups = run_indexed(entries.len(), options.threads, |index| {
         let entry = &entries[index];
         let t0 = Instant::now();
-        let data = inflate_dex(&map, entry)?;
+        let data = match inflate_dex(&map, entry, cache.as_ref()) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("warning: {}: {err}", entry.name);
+                return Ok((Vec::new(), true));
+            }
+        };
         let inflated = t0.elapsed();
         let mut lines = Vec::new();
-        for (name, buf) in logical_buffers(&entry.name, data)? {
-            lines.extend(find_in_dex_resolved(&name, &buf, query, &|text| {
-                resources.rewrite_plain(text)
-            })?);
+        let mut partial = false;
+        let buffers = match logical_buffers(&entry.name, data) {
+            Ok(buffers) => buffers,
+            Err(err) => {
+                eprintln!("warning: {}: {err}", entry.name);
+                return Ok((Vec::new(), true));
+            }
+        };
+        for (name, buf) in buffers {
+            match find_in_dex_resolved(&name, &buf, query, &|text| resources.rewrite_plain(text)) {
+                Ok(found) => lines.extend(found),
+                Err(err) => {
+                    partial = true;
+                    eprintln!("warning: {name}: {err}");
+                }
+            }
         }
         if options.debug {
             eprintln!(
@@ -615,8 +679,11 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
                 t0.elapsed().as_secs_f64() * 1_000_000.0 - inflated.as_secs_f64() * 1_000_000.0
             );
         }
-        Ok(lines)
+        Ok((lines, partial))
     })?;
+    if let Some(cache) = &cache {
+        cache.disk.evict();
+    }
     if options.debug {
         eprintln!(
             "[APK] findrefs total={:.2} us count={} workers={}",
@@ -625,11 +692,14 @@ pub fn find_refs(path: &Path, query: &RefQuery, options: &Options) -> Result<Vec
             options.threads.min(entries.len().max(1))
         );
     }
-    Ok(groups
-        .into_iter()
-        .flatten()
-        .map(|line| present_ref_line(&resources, query, &line))
-        .collect())
+    let mut report = RefReport::default();
+    for (lines, partial) in groups {
+        report.partial |= partial;
+        report
+            .lines
+            .extend(lines.into_iter().map(|line| present_ref_line(&resources, query, &line)));
+    }
+    Ok(report)
 }
 
 pub fn manifest_xml(path: &Path) -> Result<String> {
@@ -722,176 +792,19 @@ fn check_threads(threads: usize) -> Result<()> {
 
 /// True when `path` is a standalone DEX image, not a ZIP container.
 pub fn is_dex(path: &Path) -> Result<bool> {
-    let mut file = File::open(path).map_err(|source| Error::IoPath {
-        action: "open",
-        path: path.display().to_string(),
-        source,
-    })?;
-    let mut magic = [0u8; 8];
-    let read = file.read(&mut magic).map_err(|source| Error::IoPath {
-        action: "open",
-        path: path.display().to_string(),
-        source,
-    })?;
-    Ok(is_bare_dex_magic(&magic[..read]))
+    bare::has_dex_magic(path)
 }
 
-fn read_bare_dex(path: &Path) -> Result<Option<Vec<u8>>> {
-    if !is_dex(path)? {
-        return Ok(None);
-    }
-    fs::read(path)
-        .map(Some)
-        .map_err(|source| Error::IoPath {
-            action: "open",
-            path: path.display().to_string(),
-            source,
-        })
-}
-
-fn is_bare_dex_magic(magic: &[u8]) -> bool {
-    magic.len() >= 8
-        && magic.starts_with(b"dex\n")
-        && magic[4].is_ascii_digit()
-        && magic[5].is_ascii_digit()
-        && magic[6].is_ascii_digit()
-        && magic[7] == 0
-}
-
-fn reject_external_resources(options: &Options) -> Result<()> {
-    if options.resources.is_some() {
+/// `--resources` is only meaningful for a bare DEX or ABC file.
+pub fn packaged_resources(resources: Option<&Path>) -> Result<()> {
+    if resources.is_some() {
         bail!("--resources is only used with a bare DEX or ABC file");
     }
     Ok(())
 }
 
-fn external_arsc(options: &Options) -> Result<crate::arsc::ResourceTable> {
-    let Some(path) = &options.resources else {
-        return Ok(crate::arsc::ResourceTable::default());
-    };
-    if !path.is_file() {
-        bail!("{} must be a resources.arsc file", path.display());
-    }
-    let bytes = fs::read(path).map_err(|source| Error::IoPath {
-        action: "open",
-        path: path.display().to_string(),
-        source,
-    })?;
-    crate::arsc::ResourceTable::parse(&bytes)
-        .map_err(|err| Error::new(format!("{}: {err}", path.display())))
-}
-
-fn dex_label(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("classes.dex")
-        .to_string()
-}
-
-fn list_bare_dex(
-    path: &Path,
-    data: Vec<u8>,
-    prefix: Option<&str>,
-    options: &Options,
-) -> Result<Vec<String>> {
-    let label = dex_label(path);
-    let mut names = Vec::new();
-    for (_name, buf) in logical_buffers(&label, data)? {
-        names.extend(Dex::parse(&buf)?.class_descriptors(prefix)?);
-    }
-    if options.debug {
-        eprintln!("[DEX] '{label}' class_count={}", names.len());
-    }
-    Ok(names)
-}
-
-fn class_source_dex(
-    path: &Path,
-    data: Vec<u8>,
-    descriptor: &str,
-    options: &Options,
-) -> Result<String> {
-    let label = dex_label(path);
-    let mut hit = None;
-    for (name, buf) in logical_buffers(&label, data)? {
-        if Dex::parse(&buf)?.find_class_def(descriptor)?.is_some() {
-            hit = Some(buf);
-            if options.debug {
-                eprintln!("[DEBUG] Hit DEX: {name}");
-            }
-            break;
-        }
-    }
-    let Some(dex_buf) = hit else {
-        bail!("Class {descriptor} not found in DEX.");
-    };
-    let text = match options.engine {
-        Engine::Smali => smali_class(&dex_buf, descriptor)?,
-        Engine::Ddc => crate::ddc_engine::decompile_one(dex_buf, descriptor)?,
-    };
-    if options.engine == Engine::Smali {
-        return Ok(text);
-    }
-    Ok(external_arsc(options)?.rewrite_code(&text).into_owned())
-}
-
-fn find_bare_dex(
-    path: &Path,
-    data: Vec<u8>,
-    query: &RefQuery,
-    options: &Options,
-) -> Result<Vec<String>> {
-    let resources = external_arsc(options)?;
-    let label = dex_label(path);
-    let mut lines = Vec::new();
-    for (name, buf) in logical_buffers(&label, data)? {
-        lines.extend(find_in_dex_resolved(&name, &buf, query, &|text| {
-            resources.rewrite_plain(text)
-        })?);
-    }
-    Ok(lines
-        .into_iter()
-        .map(|line| present_ref_line(&resources, query, &line))
-        .collect())
-}
-
-fn dump_bare_dex(
-    path: &Path,
-    data: Vec<u8>,
-    out_dir: &Path,
-    options: &Options,
-) -> Result<DumpStats> {
-    fs::create_dir_all(out_dir)?;
-    let resources = external_arsc(options)?;
-    let label = dex_label(path);
-    let buffers = logical_buffers(&label, data)?;
-    let claims = Mutex::new(HashMap::<PathBuf, ClassRank>::new());
-    let dirs = Mutex::new(HashSet::<PathBuf>::new());
-    let mut errors = 0usize;
-    for (index, (_name, buf)) in buffers.into_iter().enumerate() {
-        let rank = ClassRank {
-            module: 0,
-            kind: 0,
-            ordinal: 1,
-            tie: 0,
-            logical: index as u32,
-        };
-        let job = DumpCtx {
-            label: &label,
-            out_dir,
-            options,
-            claims: &claims,
-            dirs: &dirs,
-            resources: &resources,
-        };
-        errors += if options.engine == Engine::Ddc {
-            dump_ddc_image(buf, rank, &job)?
-        } else {
-            dump_smali_image(buf, rank, &job)?
-        };
-    }
-    let classes = claims.lock().expect("mutex poisoned").len();
-    Ok(DumpStats { classes, errors })
+fn reject_external_resources(options: &Options) -> Result<()> {
+    packaged_resources(options.resources.as_deref())
 }
 
 fn open_apk(path: &Path) -> Result<(File, Mmap)> {
@@ -915,6 +828,7 @@ fn find_defining_dex(
     entries: &[DexEntry],
     target: &[u8],
     options: &Options,
+    cache: Option<&LoadedCache>,
 ) -> Result<Option<(String, Vec<u8>)>> {
     if entries.is_empty() {
         return Ok(None);
@@ -934,7 +848,7 @@ fn find_defining_dex(
                 if index >= best_idx.load(Ordering::Relaxed) {
                     continue;
                 }
-                match inflate_and_hit(apk, &entries[index], target) {
+                match inflate_and_hit(apk, &entries[index], target, cache) {
                     Ok(Some((name, buf))) => {
                         best_idx.fetch_min(index, Ordering::Relaxed);
                         let mut slot = best.lock().expect("mutex poisoned");
@@ -973,8 +887,12 @@ fn inflate_and_hit(
     apk: &[u8],
     entry: &DexEntry,
     target: &[u8],
+    cache: Option<&LoadedCache>,
 ) -> Result<Option<(String, Vec<u8>)>> {
-    let data = inflate_dex(apk, entry)?;
+    if class_absent_from_prefix(apk, entry, target)? {
+        return Ok(None);
+    }
+    let data = inflate_dex(apk, entry, cache)?;
     for (name, buf) in logical_buffers(&entry.name, data)? {
         let dex = Dex::parse(&buf)?;
         if dex.defines_class(target)? {
@@ -1024,7 +942,7 @@ where
     }
     results
         .into_inner()
-        .unwrap()
+        .expect("mutex poisoned")
         .into_iter()
         .enumerate()
         .map(|(index, value)| {
@@ -1042,8 +960,13 @@ struct ZipBytes<'a> {
     header_offset: u64,
 }
 
-fn inflate_dex(apk: &[u8], entry: &DexEntry) -> Result<Vec<u8>> {
-    inflate_bytes(
+fn inflate_dex(apk: &[u8], entry: &DexEntry, cache: Option<&LoadedCache>) -> Result<Vec<u8>> {
+    if let Some(cache) = cache {
+        if let Some(bytes) = cache.disk.get(&cache.key, &entry.name, entry.uncomp_size) {
+            return Ok(bytes);
+        }
+    }
+    let data = inflate_bytes(
         apk,
         ZipBytes {
             name: &entry.name,
@@ -1053,7 +976,93 @@ fn inflate_dex(apk: &[u8], entry: &DexEntry) -> Result<Vec<u8>> {
             uncompressed_size: entry.uncomp_size,
             header_offset: entry.local_header_off,
         },
-    )
+    )?;
+    if let Some(cache) = cache {
+        if let Err(err) = cache.disk.put(&cache.key, &entry.name, &data) {
+            eprintln!("warning: {err}");
+        }
+    }
+    Ok(data)
+}
+
+struct LoadedCache {
+    disk: crate::cache::DiskCache,
+    key: crate::cache::ApkKey,
+}
+
+fn open_cache(path: &Path, apk: &[u8], options: &Options) -> Option<LoadedCache> {
+    let dir = options.cache_dir.as_ref()?;
+    let disk = crate::cache::DiskCache::open(dir);
+    if let Err(err) = disk.check() {
+        eprintln!("warning: {err}");
+        return None;
+    }
+    let key = apk_cache_key(path, apk)?;
+    Some(LoadedCache { disk, key })
+}
+
+fn apk_cache_key(path: &Path, apk: &[u8]) -> Option<crate::cache::ApkKey> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let (start, end) = cd_bounds(apk).ok()?;
+    let directory = apk.get(start..end)?;
+    Some(crate::cache::ApkKey::new(path, meta.len(), mtime, directory))
+}
+
+/// `true` when a short inflate proves this DEX does not define `target`.
+fn class_absent_from_prefix(apk: &[u8], entry: &DexEntry, target: &[u8]) -> Result<bool> {
+    const MIN_GAIN: u64 = 256 * 1024;
+    const SLACK: usize = 64 * 1024;
+    if entry.method != 8 || entry.uncomp_size <= MIN_GAIN {
+        return Ok(false);
+    }
+    let size = usize::try_from(entry.uncomp_size).unwrap_or(usize::MAX);
+    let mut limit = 64 * 1024;
+    loop {
+        let out = inflate_prefix(apk, entry, limit)?;
+        if out.len() >= 8 && &out[..8] == b"dex\n041\0" {
+            return Ok(false);
+        }
+        match asc_dex::quick::probe_needed_len(&out) {
+            Some(needed) if (needed as f64) < size as f64 * 0.70 => {
+                let want = needed.saturating_add(SLACK).min(size);
+                let buf = if out.len() >= want { out } else { inflate_prefix(apk, entry, want)? };
+                return Ok(asc_dex::quick::dex_defines_class(&buf, target).ok() == Some(false));
+            }
+            Some(_) => return Ok(false),
+            None if out.len() >= size || limit >= size => return Ok(false),
+            None => limit = (limit.saturating_add(64 * 1024)).min(size),
+        }
+    }
+}
+
+fn inflate_prefix(apk: &[u8], entry: &DexEntry, limit: usize) -> Result<Vec<u8>> {
+    let off = usize::try_from(entry.local_header_off)
+        .map_err(|_| Error::new(format!("zip offset for {} exceeds this platform", entry.name)))?;
+    let name_len = bytes::u16_at(apk, off + 26)? as usize;
+    let extra_len = bytes::u16_at(apk, off + 28)? as usize;
+    let data_off = off + 30 + name_len + extra_len;
+    let comp_len = usize::try_from(entry.comp_size).unwrap_or(0);
+    let data_end = data_off.saturating_add(comp_len);
+    let comp = apk
+        .get(data_off..data_end.min(apk.len()))
+        .ok_or_else(|| Error::new(format!("truncated zip entry {}", entry.name)))?;
+    match entry.method {
+        0 => Ok(comp[..comp.len().min(limit)].to_vec()),
+        8 => {
+            let mut out = Vec::new();
+            DeflateDecoder::new(comp)
+                .take(u64::try_from(limit).unwrap_or(u64::MAX))
+                .read_to_end(&mut out)?;
+            Ok(out)
+        }
+        other => bail!("unsupported compression method: {other}"),
+    }
 }
 
 fn inflate_bytes(apk: &[u8], entry: ZipBytes<'_>) -> Result<Vec<u8>> {
@@ -1268,7 +1277,7 @@ fn append_classes_heuristic(
 }
 
 fn cd_bounds(apk: &[u8]) -> Result<(usize, usize)> {
-    let eocd = find_eocd(apk).ok_or_else(|| Error::new("EOCD not found"))?;
+    let eocd = find_eocd(apk).ok_or(Error::NoEocd)?;
     let cd_size_32 = bytes::u32_at(apk, eocd + 12)?;
     let cd_off_32 = bytes::u32_at(apk, eocd + 16)?;
     let (cd_off, cd_size) = if cd_size_32 == u32::MAX || cd_off_32 == u32::MAX {

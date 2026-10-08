@@ -92,7 +92,7 @@ Semantics for APK and AAB:
   One line is one caller. Several targets for that caller sit inside
   `matched`, separated by `; `.
 
-HAP and ABC use the same commands. `--fuzzy-class` is not applied there:
+HAP and ABC use the same commands. `--fuzzy-class` is rejected there:
 `--class` selects one class, and a member name stays an anchored regular
 expression. String and type values are still regular expressions. Hits can
 also come from resolved resource text when the input is a HAP, or a bare ABC

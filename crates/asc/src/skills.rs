@@ -2,7 +2,7 @@
 //! directory. `asc skills install` writes that snapshot into agent skill directories.
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use asc_apk::{Error, Result};
 
@@ -64,14 +64,6 @@ fn skill_dest(skills_dir: &Path, rel: &str) -> Result<PathBuf> {
             )));
         }
         dest.push(part);
-    }
-    if dest
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(Error::new(format!(
-            "skill path {rel} escapes its directory"
-        )));
     }
     Ok(dest)
 }

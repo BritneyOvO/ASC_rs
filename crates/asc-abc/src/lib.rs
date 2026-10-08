@@ -10,7 +10,7 @@ mod file;
 pub use error::{Error, Result};
 pub use file::{
     class_names, class_text, class_text_optional, find_members, find_strings,
-    find_strings_resolved, find_types, Abc,
+    find_strings_resolved, find_types, Abc, MemberKind,
 };
 
 /// `PANDA\0\0\0`, the magic at the start of an `.abc` file.

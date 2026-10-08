@@ -157,7 +157,13 @@ fn visit_resources(
             visit_resources(root, &path, prefix_resources, resources)?;
             continue;
         }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
+        let relative = path.strip_prefix(root).map_err(|_| {
+            Error::new(format!(
+                "{} is outside {}",
+                path.display(),
+                root.display()
+            ))
+        })?;
         let mut name = relative
             .components()
             .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -165,6 +171,19 @@ fn visit_resources(
             .join("/");
         if prefix_resources {
             name = format!("resources/{name}");
+        }
+        let len = entry.metadata().map_err(|source| Error::IoPath {
+            action: "open",
+            path: path.display().to_string(),
+            source,
+        })?.len();
+        // Media and large profiles are stored as their path. Reading the bytes
+        // would only be thrown away by add_file.
+        if let Some((kind, _, _)) = resource_key(&name) {
+            if kind == "media" || (kind == "profile" && len > 8192) {
+                resources.add_file(&name, b"");
+                continue;
+            }
         }
         let bytes = fs::read(&path).map_err(|source| Error::IoPath {
             action: "open",

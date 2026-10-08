@@ -2,14 +2,15 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use asc_abc::{
     class_names, class_text, find_members, find_strings, find_strings_resolved, find_types, is_abc,
+    MemberKind,
 };
 use asc_apk::{
-    dump_apk, find_refs, get_class_source, is_dex, list_classes, manifest_xml, Engine, Error,
-    MemberSel, Options, RefQuery, Result,
+    dump_apk, find_refs, get_class_source, is_dex, list_classes, manifest_xml, packaged_resources,
+    Engine, Error, MemberSel, Options, RefQuery, Result,
 };
 use asc_hap::{self, Query};
 
@@ -49,6 +50,8 @@ module.json, or config.json when that file is absent, plus pack.info.
 --engine applies to APK and bare DEX getclass and dump only.
 A bare DEX or ABC file does not resolve resources unless --resources is set.
 DEX uses a resources.arsc file. ABC uses a resources directory or a HAP.
+findrefs exits 2 when a DEX entry could not be searched; other hits are still printed.
+Inflated DEX entries are cached under ~/.cache/asc unless --no-cache is set.
 
   asc skills install
 
@@ -83,12 +86,36 @@ fn apk_options(
     debug: bool,
     engine: Engine,
     resources: Option<PathBuf>,
+    cache: &CacheArgs,
 ) -> Options {
     Options {
         threads,
         debug,
         engine,
         resources,
+        cache_dir: cache.dir(),
+    }
+}
+
+#[derive(Args, Clone)]
+struct CacheArgs {
+    /// Do not read or write the inflated-DEX cache.
+    #[arg(long, global = true)]
+    no_cache: bool,
+    /// Cache directory. The default is $ASC_CACHE_DIR, $XDG_CACHE_HOME/asc, or ~/.cache/asc.
+    #[arg(long, global = true, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+}
+
+impl CacheArgs {
+    fn dir(&self) -> Option<PathBuf> {
+        if self.no_cache {
+            None
+        } else {
+            self.cache_dir
+                .clone()
+                .or_else(asc_apk::DiskCache::default_dir)
+        }
     }
 }
 
@@ -110,6 +137,8 @@ enum Commands {
         /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
         #[arg(long, value_name = "FILE")]
         resources: Option<PathBuf>,
+        #[command(flatten)]
+        cache: CacheArgs,
     },
     /// List classes in an APK, DEX, HAP, or ABC.
     Listclass {
@@ -123,6 +152,8 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
         apk_path: PathBuf,
+        #[command(flatten)]
+        cache: CacheArgs,
     },
     /// Print an APK manifest or a HAP module config.
     Getmanifest {
@@ -147,6 +178,8 @@ enum Commands {
         /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
         #[arg(long, value_name = "FILE")]
         resources: Option<PathBuf>,
+        #[command(flatten)]
+        cache: CacheArgs,
     },
     /// Find references in an APK, DEX, HAP, or ABC.
     Findrefs {
@@ -157,6 +190,8 @@ enum Commands {
         /// resources.arsc for a bare DEX, or a resources directory or HAP for a bare ABC.
         #[arg(long, global = true, value_name = "FILE")]
         resources: Option<PathBuf>,
+        #[command(flatten)]
+        cache: CacheArgs,
         apk_path: PathBuf,
         #[command(subcommand)]
         query: FindCmd,
@@ -245,7 +280,8 @@ pub fn run() -> i32 {
         }
     };
     match execute(cli) {
-        Ok(()) => 0,
+        Ok(Exit::Done) => 0,
+        Ok(Exit::Partial) => 2,
         Err(err) => {
             eprintln!("Error: {err}");
             1
@@ -253,7 +289,12 @@ pub fn run() -> i32 {
     }
 }
 
-fn execute(cli: Cli) -> Result<()> {
+enum Exit {
+    Done,
+    Partial,
+}
+
+fn execute(cli: Cli) -> Result<Exit> {
     match cli.command {
         Commands::Getclass {
             debug,
@@ -263,20 +304,21 @@ fn execute(cli: Cli) -> Result<()> {
             apk_path,
             dalvik_class,
             resources,
+            cache,
         } => {
             let source = if let Some(data) = read_abc(&apk_path)? {
                 let text = class_text(&data, &dalvik_class).map_err(abc_err)?;
                 let table = abc_resources(resources.as_deref())?;
                 table.annotate(&text).into_owned()
             } else if hap_file(&apk_path)? {
-                archive_resources(&resources)?;
+                archive_resources(resources.as_deref())?;
                 asc_hap::get_class_source(&apk_path, &dalvik_class, &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
                 get_class_source(
                     &apk_path,
                     &dalvik_class,
-                    &apk_options(threads, debug, engine_of(engine), resources),
+                    &apk_options(threads, debug, engine_of(engine), resources, &cache),
                 )?
             };
             emit(&source, output.as_deref(), true)?;
@@ -287,6 +329,7 @@ fn execute(cli: Cli) -> Result<()> {
             prefix,
             output,
             apk_path,
+            cache,
         } => {
             let names = if let Some(data) = read_abc(&apk_path)? {
                 class_names(&data, prefix.as_deref()).map_err(abc_err)?
@@ -297,7 +340,7 @@ fn execute(cli: Cli) -> Result<()> {
                 list_classes(
                     &apk_path,
                     prefix.as_deref(),
-                    &apk_options(threads, debug, Engine::Ddc, None),
+                    &apk_options(threads, debug, Engine::Ddc, None, &cache),
                 )?
             };
             let text = if names.is_empty() {
@@ -325,7 +368,7 @@ fn execute(cli: Cli) -> Result<()> {
             if hap_file(&apk_path)? {
                 let text = asc_hap::module_json(&apk_path).map_err(hap_err)?;
                 emit(&text, output.as_deref(), true)?;
-                return Ok(());
+                return Ok(Exit::Done);
             }
             let started = std::time::Instant::now();
             let xml = manifest_xml(&apk_path)?;
@@ -344,6 +387,7 @@ fn execute(cli: Cli) -> Result<()> {
             output,
             apk_path,
             resources,
+            cache,
         } => {
             if let Some(data) = read_abc(&apk_path)? {
                 let table = abc_resources(resources.as_deref())?;
@@ -354,10 +398,10 @@ fn execute(cli: Cli) -> Result<()> {
                     stats.errors,
                     output.display()
                 );
-                return Ok(());
+                return Ok(Exit::Done);
             }
             if hap_file(&apk_path)? {
-                archive_resources(&resources)?;
+                archive_resources(resources.as_deref())?;
                 let stats = asc_hap::dump_hap(&apk_path, &output, &hap_options(threads, debug))
                     .map_err(hap_err)?;
                 eprintln!(
@@ -366,13 +410,13 @@ fn execute(cli: Cli) -> Result<()> {
                     stats.errors,
                     output.display()
                 );
-                return Ok(());
+                return Ok(Exit::Done);
             }
             let started = std::time::Instant::now();
             let stats = dump_apk(
                 &apk_path,
                 &output,
-                &apk_options(threads, debug, engine_of(engine), resources),
+                &apk_options(threads, debug, engine_of(engine), resources, &cache),
             )?;
             eprintln!(
                 "dumped {} classes ({} errors) -> {}",
@@ -391,6 +435,7 @@ fn execute(cli: Cli) -> Result<()> {
             debug,
             threads,
             resources,
+            cache,
             apk_path,
             query,
         } => {
@@ -425,18 +470,31 @@ fn execute(cli: Cli) -> Result<()> {
                 ),
             };
             let lines = if let Some(data) = read_abc(&apk_path)? {
+                reject_fuzzy(&query)?;
                 let table = abc_resources(resources.as_deref())?;
                 abc_refs(&data, &apk_path, &query, &table)?
             } else if hap_file(&apk_path)? {
-                archive_resources(&resources)?;
+                reject_fuzzy(&query)?;
+                archive_resources(resources.as_deref())?;
                 asc_hap::find_refs(&apk_path, hap_query(&query), &hap_options(threads, debug))
                     .map_err(hap_err)?
             } else {
-                find_refs(
+                let report = find_refs(
                     &apk_path,
                     &query,
-                    &apk_options(threads, debug, Engine::Ddc, resources),
-                )?
+                    &apk_options(threads, debug, Engine::Ddc, resources, &cache),
+                )?;
+                let text = if report.lines.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n", report.lines.join("\n"))
+                };
+                emit(&text, output.as_deref(), false)?;
+                return Ok(if report.partial {
+                    Exit::Partial
+                } else {
+                    Exit::Done
+                });
             };
             let text = if lines.is_empty() {
                 String::new()
@@ -449,7 +507,7 @@ fn execute(cli: Cli) -> Result<()> {
             SkillsCmd::Install => install_user_skills()?,
         },
     }
-    Ok(())
+    Ok(Exit::Done)
 }
 
 fn install_user_skills() -> Result<()> {
@@ -496,29 +554,33 @@ fn read_abc(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn abc_err(err: asc_abc::Error) -> Error {
-    Error::new(err.to_string())
+    Error::external(err)
 }
 
 fn hap_err(err: asc_hap::Error) -> Error {
-    Error::new(err.to_string())
+    Error::external(err)
 }
 
 fn hap_file(path: &Path) -> Result<bool> {
     asc_hap::is_hap(path).map_err(hap_err)
 }
 
-fn archive_resources(resources: &Option<PathBuf>) -> Result<()> {
-    if resources.is_some() {
-        bail_resources()
+fn archive_resources(resources: Option<&Path>) -> Result<()> {
+    packaged_resources(resources)
+}
+
+fn reject_fuzzy(query: &RefQuery) -> Result<()> {
+    let fuzzy = match query {
+        RefQuery::Method(sel) | RefQuery::Field(sel) => sel.fuzzy_class,
+        RefQuery::String(_) | RefQuery::Type(_) => false,
+    };
+    if fuzzy {
+        Err(Error::new(
+            "--fuzzy-class is not used for HAP or ABC",
+        ))
     } else {
         Ok(())
     }
-}
-
-fn bail_resources() -> Result<()> {
-    Err(Error::new(
-        "--resources is only used with a bare DEX or ABC file",
-    ))
 }
 
 fn abc_resources(path: Option<&Path>) -> Result<asc_hap::HapResources> {
@@ -563,14 +625,14 @@ fn abc_refs(
         })
         .map_err(abc_err),
         RefQuery::Type(pattern) => find_types(data, &file, pattern).map_err(abc_err),
-        RefQuery::Method(sel) => abc_members(data, &file, true, sel),
-        RefQuery::Field(sel) => abc_members(data, &file, false, sel),
+        RefQuery::Method(sel) => abc_members(data, &file, MemberKind::Method, sel),
+        RefQuery::Field(sel) => abc_members(data, &file, MemberKind::Field, sel),
     }
 }
 
-fn abc_members(data: &[u8], file: &str, methods: bool, sel: &MemberSel) -> Result<Vec<String>> {
+fn abc_members(data: &[u8], file: &str, kind: MemberKind, sel: &MemberSel) -> Result<Vec<String>> {
     let pattern = sel.name.as_deref().unwrap_or(".*");
-    find_members(data, file, methods, pattern, sel.class_name.as_deref()).map_err(abc_err)
+    find_members(data, file, kind, pattern, sel.class_name.as_deref()).map_err(abc_err)
 }
 
 fn emit(text: &str, output: Option<&std::path::Path>, ensure_newline: bool) -> Result<()> {
