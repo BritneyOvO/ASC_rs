@@ -1,4 +1,5 @@
 mod cli;
+mod skills;
 
 fn main() {
     let code = cli::run();

@@ -29,7 +29,25 @@ examples:
   asc findrefs app.apk type com.poc.Main
   asc findrefs app.apk method onCreate --class com.poc.Main
   asc findrefs app.apk method notify --class MainActivity --fuzzy-class -o method_refs.txt
-  asc findrefs app.apk field apiKey -o field_refs.txt"
+  asc findrefs app.apk field apiKey -o field_refs.txt
+  asc getclass app.hap com.poc.Main
+  asc listclass app.hap --prefix com.poc -o classes.txt
+  asc getmanifest app.hap -o module.json
+  asc dump app.hap -o output
+  asc findrefs app.hap string token
+  asc findrefs app.hap method onCreate --class com.poc.Main
+
+HAP commands read ets/modules.abc and other .abc members. getmanifest prints
+module.json, or config.json when that file is absent, plus pack.info.
+--engine applies to APK getclass and dump only.
+
+  asc skills install
+
+asc skills install writes:
+  ~/.grok/skills/asc
+  ~/.agents/skills/asc
+  ~/.claude/skills/asc
+  ~/.cursor/skills/asc"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,7 +79,7 @@ fn apk_options(threads: usize, debug: bool, engine: Engine) -> Options {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Locate the target class in an APK and decompile it.
+    /// Decompile one class from an APK, HAP, or ABC.
     Getclass {
         #[arg(long)]
         debug: bool,
@@ -75,7 +93,7 @@ enum Commands {
         apk_path: PathBuf,
         dalvik_class: String,
     },
-    /// List classes across all DEX entries.
+    /// List classes in an APK, HAP, or ABC.
     Listclass {
         #[arg(long)]
         debug: bool,
@@ -88,7 +106,7 @@ enum Commands {
         output: Option<PathBuf>,
         apk_path: PathBuf,
     },
-    /// Decode AndroidManifest.xml from an APK and print it.
+    /// Print an APK manifest or a HAP module config.
     Getmanifest {
         #[arg(long)]
         debug: bool,
@@ -96,7 +114,7 @@ enum Commands {
         output: Option<PathBuf>,
         apk_path: PathBuf,
     },
-    /// Decompile every class in an APK into a Java tree.
+    /// Decompile every class in an APK or HAP.
     Dump {
         #[arg(long)]
         debug: bool,
@@ -109,7 +127,7 @@ enum Commands {
         output: PathBuf,
         apk_path: PathBuf,
     },
-    /// Find code references for a string, type, method, or field.
+    /// Find references in an APK, HAP, or ABC.
     Findrefs {
         #[arg(long, global = true)]
         debug: bool,
@@ -119,6 +137,25 @@ enum Commands {
         #[command(subcommand)]
         query: FindCmd,
     },
+    /// Install the ASC skill.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillsCmd {
+    /// Install the ASC skill for Grok, Codex, Claude, and Cursor.
+    #[command(long_about = "\
+Install the ASC skill for Grok, Codex, Claude, and Cursor.
+
+Writes:
+  ~/.grok/skills/asc
+  ~/.agents/skills/asc
+  ~/.claude/skills/asc
+  ~/.cursor/skills/asc")]
+    Install,
 }
 
 #[derive(Subcommand)]
@@ -171,7 +208,7 @@ pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         let mut cmd = Cli::command();
-        let _ = cmd.print_long_help();
+        let _ = cmd.print_help();
         println!();
         return 0;
     }
@@ -364,8 +401,29 @@ fn execute(cli: Cli) -> Result<()> {
             };
             emit(&text, output.as_deref(), false)?;
         }
+        Commands::Skills { action } => match action {
+            SkillsCmd::Install => install_user_skills()?,
+        },
     }
     Ok(())
+}
+
+fn install_user_skills() -> Result<()> {
+    let home = skill_home()?;
+    for skills_dir in crate::skills::user_skill_dirs(&home) {
+        for installed in crate::skills::install_skills(&skills_dir)? {
+            println!("installed {}", installed.display());
+        }
+    }
+    Ok(())
+}
+
+fn skill_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| Error::new("HOME is not set"))
 }
 
 fn read_abc(path: &Path) -> Result<Option<Vec<u8>>> {

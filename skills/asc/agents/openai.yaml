@@ -1,0 +1,4 @@
+interface:
+  display_name: "ASC Analyst"
+  short_description: "Targeted APK, HAP, and ABC inspection"
+  default_prompt: "Use $asc to inspect an APK, AAB, HAP, or ABC and report the requested class, references, or manifest details."

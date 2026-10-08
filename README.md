@@ -17,6 +17,12 @@ asc findrefs app.apk type com.poc.Main
 asc findrefs app.apk method onCreate --class com.poc.Main
 asc findrefs app.apk method notify --class MainActivity --fuzzy-class
 asc findrefs app.apk field apiKey
+asc getclass app.hap com.poc.Main
+asc listclass app.hap --prefix com.poc -o classes.txt
+asc getmanifest app.hap -o module.json
+asc dump app.hap -o output
+asc findrefs app.hap string token
+asc findrefs app.hap method onCreate --class com.poc.Main
 ```
 
 `getclass` 和 `dump` 默认用 [ddc](https://github.com/ejfkdev/ddc) 把方法体收成带控制流的 Java。`--engine smali` 输出 baksmali 文本，指令名和寄存器都保留。`listclass`、`findrefs`、清单，以及 HAP / ABC，不走 ddc。
@@ -30,6 +36,10 @@ asc findrefs app.apk field apiKey
 `PANDA` 开头的 `.abc` 按方舟文件头现查类名、成员和字面量字符串，不建全量索引。HAP 里的代码在 `ets/modules.abc` 和其它 `*.abc`。`getmanifest` 读模块配置 `module.json`（没有则读 `config.json`）和包级 `pack.info`，并把 `$string:`、`$media:`、`$profile:` 换成 `resources/` 里的值。APK 清单里的 `@string/`、`@mipmap/` 和 `@0x7f......` 会换成 `resources.arsc` 或 `res/` 里的实际值。同一张表也写回 DEX：`getclass` 和 `dump` 里的常量、`R$type;->name`、字符串中的 `@string/`，以及 `findrefs` 命中的字符串和字段，都换成解析后的值。HAP 里 ABC 的类文本和字面量同样把 `$string:`、`$media:`、`$profile:` 换成资源值，所以按解析后的文本搜索也能命中。单独打开的 `.dex` 和 `.abc` 没有随包资源表，原文保持不动。`listclass`、`getclass`、`findrefs`、`getmanifest` 和 `dump` 可以直接读 HAP。
 
 同名类在 `getclass` 和 `dump` 里按运行时顺序保留：`classes.dex`、`classes2.dex`、`classes10.dex`，其余根目录 DEX 按中央目录顺序排在后面。Android App Bundle 里的代码在 `<module>/dex/*.dex`，清单在 `base/manifest/AndroidManifest.xml`（aapt2 protobuf XML）；同名类先保留 `base` 模块，再保留其它模块。ZIP 读取支持 store、deflate、数据描述符和 ZIP64。中央目录里的 CRC 非 0 时会核对解压结果，不一致时在标准错误告警并继续读取；CRC 为 0 的条目不核对。
+
+## Skills
+
+`asc skills install` 把 ASC 的 agent 说明安装到 `~/.grok/skills/asc`、`~/.agents/skills/asc`、`~/.claude/skills/asc` 和 `~/.cursor/skills/asc`。
 
 ## 构建
 
