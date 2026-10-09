@@ -7,6 +7,7 @@ repository.workspace = true
 description = "File-level diff of APK, HAP, and other ZIP archives"
 
 [dependencies]
+asc-apk.workspace = true
 asc-so.workspace = true
 flate2.workspace = true
 memmap2.workspace = true

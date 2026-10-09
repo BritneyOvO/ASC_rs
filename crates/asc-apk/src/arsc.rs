@@ -3,7 +3,7 @@
 //! Default configurations win over qualified ones, matching an unqualified
 //! `@string/name`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
 
@@ -535,6 +535,387 @@ fn render_value(data_type: u8, data: u32, global: &[String]) -> Option<(String, 
     }
 }
 
+/// Maps a packaged file path to the resource name stored in `resources.arsc`.
+///
+/// `aapt2` path shortening rewrites `res/drawable-hdpi/icon.png` to something
+/// like `r/d/c.png`. The table still has the type, configuration, and entry
+/// name, so the shortened path can be put back. A path that does not name a
+/// file resource is left out. Two entries that would restore to the same path
+/// are left out as well, so a later diff does not merge unrelated files.
+pub fn resource_paths(data: &[u8]) -> Result<BTreeMap<String, String>> {
+    if data.len() < 12 || u16_at(data, 0)? != 0x0002 {
+        bail!("resources.arsc is not a resource table");
+    }
+    let header_size = usize::from(u16_at(data, 2)?);
+    let mut pairs = Vec::new();
+    let mut global = Vec::new();
+    let mut pos = header_size.max(12);
+    while pos + 8 <= data.len() {
+        let kind = u16_at(data, pos)?;
+        let size = usize::try_from(u32_at(data, pos + 4)?).unwrap_or(0);
+        if size < 8 || pos + size > data.len() {
+            break;
+        }
+        let chunk = &data[pos..pos + size];
+        match kind {
+            0x0001 => global = parse_pool(chunk)?,
+            0x0200 => collect_package_paths(chunk, &global, &mut pairs)?,
+            _ => {}
+        }
+        pos += size;
+    }
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, restored) in &pairs {
+        *counts.entry(restored.clone()).or_default() += 1;
+    }
+    Ok(pairs
+        .into_iter()
+        .filter(|(_, restored)| counts.get(restored) == Some(&1))
+        .collect())
+}
+
+fn collect_package_paths(
+    chunk: &[u8],
+    global: &[String],
+    pairs: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if chunk.len() < 284 {
+        return Ok(());
+    }
+    let header_size = usize::from(u16_at(chunk, 2)?);
+    let type_off = usize::try_from(u32_at(chunk, 268)?).unwrap_or(usize::MAX);
+    let key_off = usize::try_from(u32_at(chunk, 276)?).unwrap_or(usize::MAX);
+    if type_off >= chunk.len() || key_off >= chunk.len() {
+        return Ok(());
+    }
+    let type_pool = parse_pool(&chunk[type_off..])?;
+    let key_pool = parse_pool(&chunk[key_off..])?;
+    let mut pos = header_size;
+    while pos + 8 <= chunk.len() {
+        let kind = u16_at(chunk, pos)?;
+        let size = usize::try_from(u32_at(chunk, pos + 4)?).unwrap_or(0);
+        if size < 8 || pos + size > chunk.len() {
+            break;
+        }
+        if kind == 0x0201 {
+            collect_type_paths(
+                &chunk[pos..pos + size],
+                &type_pool,
+                &key_pool,
+                global,
+                pairs,
+            );
+        }
+        pos += size;
+    }
+    Ok(())
+}
+
+fn collect_type_paths(
+    chunk: &[u8],
+    type_pool: &[String],
+    key_pool: &[String],
+    global: &[String],
+    pairs: &mut Vec<(String, String)>,
+) {
+    if chunk.len() < 20 {
+        return;
+    }
+    let header_size = usize::from(u16_at(chunk, 2).unwrap_or(0));
+    let id = chunk[8];
+    let flags = chunk[9];
+    let Ok(entry_count) = usize::try_from(u32_at(chunk, 12).unwrap_or(0)) else {
+        return;
+    };
+    let Ok(entries_start) = usize::try_from(u32_at(chunk, 16).unwrap_or(0)) else {
+        return;
+    };
+    let type_index = usize::from(id).saturating_sub(1);
+    let Some(type_name) = type_pool.get(type_index) else {
+        return;
+    };
+    if type_name.is_empty() || type_name.contains('/') {
+        return;
+    }
+    let qualifiers = config_qualifiers(chunk);
+    for index in 0..entry_count {
+        let Some((.., entry_at)) = entry_offset(chunk, header_size, entries_start, flags, index)
+        else {
+            continue;
+        };
+        let Some((key, value, _)) = read_entry(chunk, entry_at, global) else {
+            continue;
+        };
+        let Some(entry_name) = key_pool.get(usize::try_from(key).unwrap_or(usize::MAX)) else {
+            continue;
+        };
+        let Some(zip_path) = resource_zip_path(&value) else {
+            continue;
+        };
+        if entry_name.is_empty() || entry_name.contains('/') {
+            continue;
+        }
+        let restored = restored_path(type_name, &qualifiers, entry_name, extension(zip_path));
+        if restored != zip_path {
+            pairs.push((zip_path.to_string(), restored));
+        }
+    }
+}
+
+fn resource_zip_path(value: &str) -> Option<&str> {
+    let path = value.strip_prefix('/').unwrap_or(value);
+    if path.starts_with("res/") || path.starts_with("r/") {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn extension(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    if file.ends_with(".9.png") {
+        ".9.png"
+    } else {
+        file.rfind('.').map(|index| &file[index..]).unwrap_or("")
+    }
+}
+
+fn restored_path(type_name: &str, qualifiers: &str, entry: &str, extension: &str) -> String {
+    if qualifiers.is_empty() {
+        format!("res/{type_name}/{entry}{extension}")
+    } else {
+        format!("res/{type_name}-{qualifiers}/{entry}{extension}")
+    }
+}
+
+/// Android resource directory qualifiers for one `ResTable_config`.
+///
+/// The config sits at byte 20 of a `ResTable_type`. Fields past `size` are absent.
+fn config_qualifiers(chunk: &[u8]) -> String {
+    let size = usize::try_from(u32_at(chunk, 20).unwrap_or(0)).unwrap_or(0);
+    if size < 4 || 20 + size > chunk.len() {
+        return String::new();
+    }
+    let config = &chunk[20..20 + size];
+    let mut parts = Vec::new();
+    let mcc = config_u16(config, 4);
+    let mnc = config_u16(config, 6);
+    if mcc != 0 {
+        parts.push(format!("mcc{mcc}"));
+    }
+    if mnc != 0 {
+        parts.push(format!("mnc{mnc}"));
+    }
+    if let Some(locale) = locale_qualifier(config) {
+        parts.push(locale);
+    }
+    let screen_layout = config_u8(config, 28);
+    match screen_layout & 0xc0 {
+        0x40 => parts.push("ldltr".to_string()),
+        0x80 => parts.push("ldrtl".to_string()),
+        _ => {}
+    }
+    let smallest = config_u16(config, 30);
+    if smallest != 0 {
+        parts.push(format!("sw{smallest}dp"));
+    }
+    let width_dp = config_u16(config, 32);
+    let height_dp = config_u16(config, 34);
+    if width_dp != 0 {
+        parts.push(format!("w{width_dp}dp"));
+    }
+    if height_dp != 0 {
+        parts.push(format!("h{height_dp}dp"));
+    }
+    match screen_layout & 0x0f {
+        0x01 => parts.push("small".to_string()),
+        0x02 => parts.push("normal".to_string()),
+        0x03 => parts.push("large".to_string()),
+        0x04 => parts.push("xlarge".to_string()),
+        _ => {}
+    }
+    match screen_layout & 0x30 {
+        0x10 => parts.push("notlong".to_string()),
+        0x20 => parts.push("long".to_string()),
+        _ => {}
+    }
+    let layout2 = config_u8(config, 48);
+    match layout2 & 0x03 {
+        1 => parts.push("notround".to_string()),
+        2 => parts.push("round".to_string()),
+        _ => {}
+    }
+    let color_mode = config_u8(config, 49);
+    match color_mode & 0x03 {
+        1 => parts.push("nowidecg".to_string()),
+        2 => parts.push("widecg".to_string()),
+        _ => {}
+    }
+    match color_mode & 0x0c {
+        0x04 => parts.push("lowdr".to_string()),
+        0x08 => parts.push("highdr".to_string()),
+        _ => {}
+    }
+    match config_u8(config, 12) {
+        1 => parts.push("port".to_string()),
+        2 => parts.push("land".to_string()),
+        3 => parts.push("square".to_string()),
+        _ => {}
+    }
+    match config_u8(config, 29) & 0x0f {
+        0x02 => parts.push("desk".to_string()),
+        0x03 => parts.push("car".to_string()),
+        0x04 => parts.push("television".to_string()),
+        0x05 => parts.push("appliance".to_string()),
+        0x06 => parts.push("watch".to_string()),
+        0x07 => parts.push("vrheadset".to_string()),
+        _ => {}
+    }
+    match config_u8(config, 29) & 0x30 {
+        0x10 => parts.push("notnight".to_string()),
+        0x20 => parts.push("night".to_string()),
+        _ => {}
+    }
+    match config_u16(config, 14) {
+        0 => {}
+        120 => parts.push("ldpi".to_string()),
+        160 => parts.push("mdpi".to_string()),
+        213 => parts.push("tvdpi".to_string()),
+        240 => parts.push("hdpi".to_string()),
+        320 => parts.push("xhdpi".to_string()),
+        480 => parts.push("xxhdpi".to_string()),
+        640 => parts.push("xxxhdpi".to_string()),
+        0xfffe => parts.push("anydpi".to_string()),
+        0xffff => parts.push("nodpi".to_string()),
+        other => parts.push(format!("{other}dpi")),
+    }
+    match config_u8(config, 13) {
+        1 => parts.push("notouch".to_string()),
+        2 => parts.push("stylus".to_string()),
+        3 => parts.push("finger".to_string()),
+        _ => {}
+    }
+    let input_flags = config_u8(config, 18);
+    match input_flags & 0x03 {
+        1 => parts.push("keysexposed".to_string()),
+        2 => parts.push("keyshidden".to_string()),
+        3 => parts.push("keyssoft".to_string()),
+        _ => {}
+    }
+    match config_u8(config, 16) {
+        1 => parts.push("nokeys".to_string()),
+        2 => parts.push("qwerty".to_string()),
+        3 => parts.push("12key".to_string()),
+        _ => {}
+    }
+    match input_flags & 0x0c {
+        0x04 => parts.push("navexposed".to_string()),
+        0x08 => parts.push("navhidden".to_string()),
+        _ => {}
+    }
+    match config_u8(config, 17) {
+        1 => parts.push("nonav".to_string()),
+        2 => parts.push("dpad".to_string()),
+        3 => parts.push("trackball".to_string()),
+        4 => parts.push("wheel".to_string()),
+        _ => {}
+    }
+    let screen_width = config_u16(config, 20);
+    let screen_height = config_u16(config, 22);
+    if screen_width != 0 || screen_height != 0 {
+        parts.push(format!("{screen_width}x{screen_height}"));
+    }
+    let sdk = config_u16(config, 24);
+    let minor = config_u16(config, 26);
+    if sdk != 0 {
+        if minor == 0 {
+            parts.push(format!("v{sdk}"));
+        } else {
+            parts.push(format!("v{sdk}.{minor}"));
+        }
+    }
+    parts.join("-")
+}
+
+fn config_u8(config: &[u8], offset: usize) -> u8 {
+    config.get(offset).copied().unwrap_or(0)
+}
+
+fn config_u16(config: &[u8], offset: usize) -> u16 {
+    config
+        .get(offset..offset + 2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .unwrap_or(0)
+}
+
+fn locale_qualifier(config: &[u8]) -> Option<String> {
+    let locale = u32::from(config_u16(config, 8)) | (u32::from(config_u16(config, 10)) << 16);
+    let script = config.get(36..40).unwrap_or(&[]);
+    let variant = config.get(40..48).unwrap_or(&[]);
+    let language = unpack_locale_chars([config_u8(config, 8), config_u8(config, 9)], b'a');
+    let region = unpack_locale_chars([config_u8(config, 10), config_u8(config, 11)], b'0');
+    let script = ascii_field(script);
+    let variant = ascii_field(variant);
+    if locale == 0 && script.is_empty() && variant.is_empty() {
+        return None;
+    }
+    if script.is_empty() && variant.is_empty() {
+        if language.is_empty() {
+            return None;
+        }
+        if region.is_empty() {
+            return Some(language);
+        }
+        return Some(format!("{language}-r{region}"));
+    }
+    let mut tag = String::from("b+");
+    tag.push_str(if language.is_empty() {
+        "und"
+    } else {
+        &language
+    });
+    if !script.is_empty() {
+        tag.push('+');
+        tag.push_str(&script);
+    }
+    if !region.is_empty() {
+        tag.push('+');
+        tag.push_str(&region);
+    }
+    if !variant.is_empty() {
+        tag.push('+');
+        tag.push_str(&variant);
+    }
+    Some(tag)
+}
+
+fn unpack_locale_chars(bytes: [u8; 2], base: u8) -> String {
+    if bytes[0] & 0x80 != 0 {
+        let first = u32::from(bytes[1] & 0x1f);
+        let second = u32::from((bytes[1] & 0xe0) >> 5) + u32::from((bytes[0] & 0x03) << 3);
+        let third = u32::from((bytes[0] & 0x7c) >> 2);
+        return [first, second, third]
+            .into_iter()
+            .filter_map(|value| u8::try_from(u32::from(base) + value).ok())
+            .map(char::from)
+            .collect();
+    }
+    bytes
+        .into_iter()
+        .filter(|byte| *byte != 0)
+        .map(char::from)
+        .collect()
+}
+
+fn ascii_field(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .map(char::from)
+        .collect()
+}
+
 /// Whether a `ResTable_type` carries the unqualified configuration.
 ///
 /// Every qualifier counts: density, uiMode (night), sdkVersion, orientation,
@@ -1054,6 +1435,18 @@ mod tests {
         assert_eq!(empty.rewrite_code(untouched), untouched);
     }
 
+    #[test]
+    fn short_resource_paths_restore_the_entry_name() {
+        let global = utf8_pool(&["r/d/c.xml"]);
+        let mut package = example_package(utf8_pool(&["drawable"]), utf8_pool(&["icon"]));
+        package.extend(type_chunk(240, 0x03, 0));
+        let paths = super::resource_paths(&arsc_table(global, package)).unwrap();
+        assert_eq!(
+            paths.get("r/d/c.xml").map(String::as_str),
+            Some("res/drawable-hdpi/icon.xml")
+        );
+    }
+
     /// A resource table whose only chunk is a global string pool. `body` holds
     /// the offset table and string data after the 28 byte pool header.
     fn arsc_with_pool(count: u32, body: &[u8], utf8: bool) -> Vec<u8> {
@@ -1106,17 +1499,15 @@ mod tests {
     fn a_density_variant_does_not_displace_the_default() {
         // The default value comes first, an xhdpi variant with a different
         // value second. The variant is not a default, so it must not win.
-        let table =
-            ResourceTable::parse(&arsc_with_string_variants(&[("day", 0), ("dense", 320)]))
-                .unwrap();
+        let table = ResourceTable::parse(&arsc_with_string_variants(&[("day", 0), ("dense", 320)]))
+            .unwrap();
         assert_eq!(table.rewrite_plain("@string/app_name"), "day");
     }
 
     #[test]
     fn a_late_default_still_beats_an_earlier_variant() {
-        let table =
-            ResourceTable::parse(&arsc_with_string_variants(&[("dense", 320), ("day", 0)]))
-                .unwrap();
+        let table = ResourceTable::parse(&arsc_with_string_variants(&[("dense", 320), ("day", 0)]))
+            .unwrap();
         assert_eq!(table.rewrite_plain("@string/app_name"), "day");
     }
 

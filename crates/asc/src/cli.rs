@@ -206,7 +206,8 @@ enum Commands {
     },
     /// Compare two APK, HAP, or HSP archives by file path and CRC.
     /// Changed native libraries also compare ELF symbols and disassemble
-    /// x86, x86_64, and AArch64 code.
+    /// x86, x86_64, and AArch64 code. Short `r/` paths are restored from
+    /// resources.arsc before entries are matched.
     Diff {
         /// Only entries whose path starts with this prefix, such as assets/.
         #[arg(long)]
@@ -531,11 +532,9 @@ fn execute(cli: Cli) -> Result<Exit> {
             let left_archive = asc_diff::Archive::open(&left).map_err(Error::external)?;
             let right_archive = asc_diff::Archive::open(&right).map_err(Error::external)?;
             let report = match prefix.as_deref() {
-                Some(prefix) => asc_diff::ArchiveDiff::between_prefix(
-                    &left_archive,
-                    &right_archive,
-                    prefix,
-                ),
+                Some(prefix) => {
+                    asc_diff::ArchiveDiff::between_prefix(&left_archive, &right_archive, prefix)
+                }
                 None => asc_diff::ArchiveDiff::between(&left_archive, &right_archive),
             };
             print!("{report}");
@@ -612,9 +611,7 @@ fn reject_fuzzy(query: &RefQuery) -> Result<()> {
         RefQuery::String(_) | RefQuery::Type(_) => false,
     };
     if fuzzy {
-        Err(Error::new(
-            "--fuzzy-class is not used for HAP or ABC",
-        ))
+        Err(Error::new("--fuzzy-class is not used for HAP or ABC"))
     } else {
         Ok(())
     }
@@ -657,10 +654,10 @@ fn abc_refs(
         RefQuery::String(pattern) if resources.is_empty() => {
             find_strings(data, &file, pattern).map_err(abc_err)
         }
-        RefQuery::String(pattern) => find_strings_resolved(data, &file, pattern, &|raw| {
-            resources.resolve_literal(raw)
-        })
-        .map_err(abc_err),
+        RefQuery::String(pattern) => {
+            find_strings_resolved(data, &file, pattern, &|raw| resources.resolve_literal(raw))
+                .map_err(abc_err)
+        }
         RefQuery::Type(pattern) => find_types(data, &file, pattern).map_err(abc_err),
         RefQuery::Method(sel) => abc_members(data, &file, MemberKind::Method, sel),
         RefQuery::Field(sel) => abc_members(data, &file, MemberKind::Field, sel),

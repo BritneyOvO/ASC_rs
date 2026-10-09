@@ -156,8 +156,10 @@ impl ArchiveDiff {
 
     /// Like [`between`](Self::between), but only entries whose path starts with `prefix`.
     pub fn between_prefix(left: &Archive, right: &Archive, prefix: &str) -> Self {
-        let left_map = by_name(left.entries(), prefix);
-        let right_map = by_name(right.entries(), prefix);
+        let left_paths = resource_names(left);
+        let right_paths = resource_names(right);
+        let left_map = by_name(left.entries(), prefix, &left_paths);
+        let right_map = by_name(right.entries(), prefix, &right_paths);
         let mut groups: BTreeMap<Group, GroupDiff> = BTreeMap::new();
         for (name, entry) in &left_map {
             let group = ensure(&mut groups, name);
@@ -285,12 +287,49 @@ fn ensure<'a>(groups: &'a mut BTreeMap<Group, GroupDiff>, name: &str) -> &'a mut
     })
 }
 
-fn by_name<'a>(entries: &'a [FileEntry], prefix: &str) -> BTreeMap<&'a str, &'a FileEntry> {
-    entries
-        .iter()
-        .filter(|entry| entry.name.starts_with(prefix))
-        .map(|entry| (entry.name.as_str(), entry))
-        .collect()
+fn resource_names(archive: &Archive) -> BTreeMap<String, String> {
+    let Ok(bytes) = archive.read("resources.arsc") else {
+        return BTreeMap::new();
+    };
+    asc_apk::resource_paths(&bytes).unwrap_or_default()
+}
+
+fn by_name<'a>(
+    entries: &'a [FileEntry],
+    prefix: &str,
+    paths: &BTreeMap<String, String>,
+) -> BTreeMap<String, &'a FileEntry> {
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let restored = paths
+            .get(&entry.name)
+            .map(String::as_str)
+            .unwrap_or(entry.name.as_str());
+        if !prefix.is_empty() && !entry.name.starts_with(prefix) && !restored.starts_with(prefix) {
+            continue;
+        }
+        let key = if out.contains_key(restored) {
+            disambiguate(&out, &entry.name)
+        } else {
+            restored.to_string()
+        };
+        out.insert(key, entry);
+    }
+    out
+}
+
+fn disambiguate(taken: &BTreeMap<String, &FileEntry>, original: &str) -> String {
+    if !taken.contains_key(original) {
+        return original.to_string();
+    }
+    let mut index = 2u32;
+    loop {
+        let candidate = format!("{original}#{index}");
+        if !taken.contains_key(&candidate) {
+            return candidate;
+        }
+        index = index.saturating_add(1);
+    }
 }
 
 impl fmt::Display for ArchiveDiff {

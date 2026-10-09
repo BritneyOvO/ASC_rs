@@ -2,7 +2,8 @@
 //!
 //! The comparison uses each entry's path and CRC. `META-INF` files themselves
 //! are not compared. Signature blocks there are read only to extract X.509
-//! certificates. DEX and resource tables are not decoded.
+//! certificates. Shortened `r/` paths are restored from `resources.arsc`
+//! before entries are matched. DEX files are not decoded.
 
 #[macro_use]
 mod error;

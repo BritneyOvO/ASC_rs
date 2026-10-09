@@ -338,3 +338,110 @@ fn write_sh32(file: &mut [u8], shoff: usize, index: usize, section: Section) {
     let entsize = if section.kind == 11 { 16u32 } else { 1 };
     file[at + 36..at + 40].copy_from_slice(&entsize.to_le_bytes());
 }
+
+#[test]
+fn shortened_resource_paths_match_by_restored_name() {
+    let dir = std::env::temp_dir().join(format!("asc-diff-res-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (left, right) = write_pair(
+        &dir,
+        &[
+            ("resources.arsc", &file_arsc("r/d/c.xml")),
+            ("r/d/c.xml", b"icon"),
+            ("assets/a.txt", b"same"),
+        ],
+        &[
+            ("resources.arsc", &file_arsc("r/ab/z.xml")),
+            ("r/ab/z.xml", b"icon2"),
+            ("assets/a.txt", b"same"),
+        ],
+    );
+    let diff = ArchiveDiff::between(
+        &Archive::open(&left).unwrap(),
+        &Archive::open(&right).unwrap(),
+    );
+    let shown = diff.to_string();
+    assert!(
+        shown.contains("res: changed 1, added 0, removed 0, unchanged 0"),
+        "{shown}"
+    );
+    assert!(shown.contains("~ res/drawable-hdpi/icon.xml"), "{shown}");
+    assert!(!shown.contains("r/d/c.xml"), "{shown}");
+    assert!(!shown.contains("r/ab/z.xml"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn file_arsc(path: &str) -> Vec<u8> {
+    fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    fn pool(strings: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        for text in strings {
+            offsets.push(u32::try_from(body.len()).unwrap());
+            body.push(u8::try_from(text.chars().count()).unwrap());
+            body.push(u8::try_from(text.len()).unwrap());
+            body.extend_from_slice(text.as_bytes());
+            body.push(0);
+        }
+        let header = 28usize;
+        let strings_start = header + strings.len() * 4;
+        let mut out = vec![0u8; strings_start];
+        put_u16(&mut out, 0, 1);
+        put_u16(&mut out, 2, 28);
+        put_u32(&mut out, 8, u32::try_from(strings.len()).unwrap());
+        put_u32(&mut out, 16, 1 << 8);
+        put_u32(&mut out, 20, u32::try_from(strings_start).unwrap());
+        for (index, offset) in offsets.iter().enumerate() {
+            put_u32(&mut out, header + index * 4, *offset);
+        }
+        out.extend(body);
+        let len = u32::try_from(out.len()).unwrap();
+        put_u32(&mut out, 4, len);
+        out
+    }
+    let global = pool(&[path]);
+    let mut package = vec![0u8; 288];
+    put_u16(&mut package, 0, 0x0200);
+    put_u16(&mut package, 2, 288);
+    put_u32(&mut package, 8, 0x7f);
+    let type_off = package.len();
+    package.extend(pool(&["drawable"]));
+    let key_off = package.len();
+    package.extend(pool(&["icon"]));
+    put_u32(&mut package, 268, u32::try_from(type_off).unwrap());
+    put_u32(&mut package, 276, u32::try_from(key_off).unwrap());
+    let config_size = 28u32;
+    let header_size = 20 + config_size as usize;
+    let entries_start = header_size + 4;
+    let mut chunk = vec![0u8; entries_start + 16];
+    put_u16(&mut chunk, 0, 0x0201);
+    put_u16(&mut chunk, 2, u16::try_from(header_size).unwrap());
+    chunk[8] = 1;
+    put_u32(&mut chunk, 12, 1);
+    put_u32(&mut chunk, 16, u32::try_from(entries_start).unwrap());
+    put_u32(&mut chunk, 20, config_size);
+    put_u16(&mut chunk, 34, 240);
+    put_u16(&mut chunk, entries_start, 8);
+    put_u16(&mut chunk, entries_start + 8, 8);
+    chunk[entries_start + 11] = 0x03;
+    let chunk_len = u32::try_from(chunk.len()).unwrap();
+    put_u32(&mut chunk, 4, chunk_len);
+    package.extend(chunk);
+    let package_len = u32::try_from(package.len()).unwrap();
+    put_u32(&mut package, 4, package_len);
+    let mut table = vec![0u8; 12];
+    put_u16(&mut table, 0, 0x0002);
+    put_u16(&mut table, 2, 12);
+    put_u32(&mut table, 8, 1);
+    table.extend(global);
+    table.extend(package);
+    let table_len = u32::try_from(table.len()).unwrap();
+    put_u32(&mut table, 4, table_len);
+    table
+}
