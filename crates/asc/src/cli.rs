@@ -205,6 +205,8 @@ enum Commands {
         query: FindCmd,
     },
     /// Compare two APK, HAP, or HSP archives by file path and CRC.
+    /// Changed native libraries also compare ELF symbols and disassemble
+    /// x86, x86_64, and AArch64 code.
     Diff {
         /// Only entries whose path starts with this prefix, such as assets/.
         #[arg(long)]

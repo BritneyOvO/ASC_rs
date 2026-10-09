@@ -74,6 +74,19 @@ pub struct ContentChange {
     pub name: String,
     pub left_size: u64,
     pub right_size: u64,
+    pub native: Option<NativeDiff>,
+}
+
+/// ELF comparison for one shared object whose bytes changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeDiff {
+    Elf {
+        diff: asc_so::ElfDiff,
+        disassembly: Vec<asc_so::DisasmBlock>,
+        /// Present when a file's section headers and program headers disagreed.
+        link_notes: Vec<String>,
+    },
+    Unreadable(String),
 }
 
 /// Added, removed, and changed files in one group.
@@ -160,6 +173,7 @@ impl ArchiveDiff {
                     name: name.to_string(),
                     left_size: entry.size,
                     right_size: other.size,
+                    native: native_diff(left, right, name),
                 }),
             }
         }
@@ -173,9 +187,15 @@ impl ArchiveDiff {
             });
         }
         for group in groups.values_mut() {
-            group.added.sort_by(|left, right| left.name.cmp(&right.name));
-            group.removed.sort_by(|left, right| left.name.cmp(&right.name));
-            group.changed.sort_by(|left, right| left.name.cmp(&right.name));
+            group
+                .added
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            group
+                .removed
+                .sort_by(|left, right| left.name.cmp(&right.name));
+            group
+                .changed
+                .sort_by(|left, right| left.name.cmp(&right.name));
         }
         let certificates = wants_certificates(prefix)
             .then(|| CertificateDiff::between(left.certificates(), right.certificates()));
@@ -202,12 +222,52 @@ impl ArchiveDiff {
     }
 }
 
-
 fn is_hap_module_file(name: &str) -> bool {
     matches!(
         name,
         "module.json" | "config.json" | "pack.info" | "pkgContextInfo.json"
     )
+}
+
+fn native_diff(left: &Archive, right: &Archive, name: &str) -> Option<NativeDiff> {
+    if Group::of(name) != Group::Native {
+        return None;
+    }
+    let parsed = match (left.read(name), right.read(name)) {
+        (Ok(left_bytes), Ok(right_bytes)) => {
+            match (
+                asc_so::ElfInfo::parse(&left_bytes),
+                asc_so::ElfInfo::parse(&right_bytes),
+            ) {
+                (Ok(left_elf), Ok(right_elf)) => {
+                    let diff = left_elf.diff(&right_elf);
+                    let disassembly = asc_so::disassemble_changes(
+                        &left_bytes,
+                        &right_bytes,
+                        &left_elf,
+                        &right_elf,
+                    );
+                    let link_notes = link_notes(&left_elf, &right_elf);
+                    NativeDiff::Elf {
+                        diff,
+                        disassembly,
+                        link_notes,
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => NativeDiff::Unreadable(err.to_string()),
+            }
+        }
+        (Err(err), _) | (_, Err(err)) => NativeDiff::Unreadable(err.to_string()),
+    };
+    Some(parsed)
+}
+
+fn link_notes(left: &asc_so::ElfInfo, right: &asc_so::ElfInfo) -> Vec<String> {
+    if left.program_headers_preferred || right.program_headers_preferred {
+        vec!["link: program headers override sections".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn wants_certificates(prefix: &str) -> bool {
@@ -268,12 +328,71 @@ impl fmt::Display for ArchiveDiff {
                     "  ~ {}  {} -> {} bytes",
                     entry.name, entry.left_size, entry.right_size
                 )?;
+                if let Some(native) = &entry.native {
+                    write_native(formatter, native)?;
+                }
             }
         }
         if let Some(certificates) = &self.certificates {
             write_certificates(formatter, certificates)?;
         }
         Ok(())
+    }
+}
+
+fn write_native(formatter: &mut fmt::Formatter<'_>, native: &NativeDiff) -> fmt::Result {
+    match native {
+        NativeDiff::Unreadable(err) => writeln!(formatter, "    elf: {err}"),
+        NativeDiff::Elf {
+            diff,
+            disassembly,
+            link_notes,
+        } if diff.is_empty() && disassembly.is_empty() && link_notes.is_empty() => {
+            writeln!(formatter, "    elf: symbols unchanged")
+        }
+        NativeDiff::Elf {
+            diff,
+            disassembly,
+            link_notes,
+        } => {
+            for note in link_notes {
+                writeln!(formatter, "    {note}")?;
+            }
+            if diff.is_empty() && disassembly.is_empty() {
+                return writeln!(formatter, "    elf: symbols unchanged");
+            }
+            for (name, left, right) in &diff.header {
+                writeln!(formatter, "    {name}: {left} -> {right}")?;
+            }
+            for name in &diff.needed_removed {
+                writeln!(formatter, "    needed - {name}")?;
+            }
+            for name in &diff.needed_added {
+                writeln!(formatter, "    needed + {name}")?;
+            }
+            for name in &diff.imports_removed {
+                writeln!(formatter, "    import - {name}")?;
+            }
+            for name in &diff.imports_added {
+                writeln!(formatter, "    import + {name}")?;
+            }
+            for name in &diff.exports_removed {
+                writeln!(formatter, "    export - {name}")?;
+            }
+            for name in &diff.exports_added {
+                writeln!(formatter, "    export + {name}")?;
+            }
+            for block in disassembly {
+                writeln!(formatter, "    disasm {}", block.title)?;
+                for line in &block.left {
+                    writeln!(formatter, "      < {line}")?;
+                }
+                for line in &block.right {
+                    writeln!(formatter, "      > {line}")?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

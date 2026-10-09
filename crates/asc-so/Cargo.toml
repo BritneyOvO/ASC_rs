@@ -1,0 +1,12 @@
+[package]
+name = "asc-so"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ELF shared-object comparison and x86, x86_64, and AArch64 disassembly"
+
+[dependencies]
+disarm64 = "0.2.0"
+iced-x86 = "1.21.0"
+thiserror.workspace = true

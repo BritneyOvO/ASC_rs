@@ -57,7 +57,11 @@ fn store_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
     archive
 }
 
-fn write_pair(dir: &Path, left: &[(&str, &[u8])], right: &[(&str, &[u8])]) -> (std::path::PathBuf, std::path::PathBuf) {
+fn write_pair(
+    dir: &Path,
+    left: &[(&str, &[u8])],
+    right: &[(&str, &[u8])],
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let left_path = dir.join("left.zip");
     let right_path = dir.join("right.zip");
     std::fs::write(&left_path, store_zip(left)).unwrap();
@@ -89,12 +93,19 @@ fn groups_assets_separately_from_dex_and_keeps_identical_files() {
             ("META-INF/MANIFEST.MF", b"right-sign"),
         ],
     );
-    let diff = ArchiveDiff::between(&Archive::open(&left).unwrap(), &Archive::open(&right).unwrap());
+    let diff = ArchiveDiff::between(
+        &Archive::open(&left).unwrap(),
+        &Archive::open(&right).unwrap(),
+    );
     assert_eq!(diff.unchanged_count(), 2);
     assert_eq!(diff.added_count(), 1);
     assert_eq!(diff.removed_count(), 1);
     assert_eq!(diff.changed_count(), 2);
-    let assets = diff.groups.iter().find(|group| group.group == Group::Assets).unwrap();
+    let assets = diff
+        .groups
+        .iter()
+        .find(|group| group.group == Group::Assets)
+        .unwrap();
     assert_eq!(assets.unchanged, 1);
     assert_eq!(assets.added[0].name, "assets/new.txt");
     assert_eq!(assets.removed[0].name, "assets/old.txt");
@@ -107,7 +118,10 @@ fn groups_assets_separately_from_dex_and_keeps_identical_files() {
         "assets/",
     );
     assert_eq!(prefixed.changed_count(), 1);
-    assert!(prefixed.groups.iter().all(|group| group.group == Group::Assets));
+    assert!(prefixed
+        .groups
+        .iter()
+        .all(|group| group.group == Group::Assets));
     let shown = diff.to_string();
     assert!(shown.contains("assets/changed.txt"), "{shown}");
     assert!(shown.contains("classes.dex"), "{shown}");
@@ -218,10 +232,109 @@ fn hap_entries_are_grouped_and_the_sign_block_is_a_certificate() {
     assert!(shown.contains("module:"), "{shown}");
     assert!(shown.contains("abc:"), "{shown}");
     assert!(shown.contains("lib:"), "{shown}");
+    assert!(shown.contains("elf: not an ELF file"), "{shown}");
     assert!(shown.contains("resources:"), "{shown}");
     assert!(shown.contains("CN=alpha"), "{shown}");
     assert!(shown.contains("CN=beta"), "{shown}");
     assert!(shown.contains("Source: hap sign block"), "{shown}");
     assert!(!shown.contains("hap sign block>"), "{shown}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn changed_x86_so_prints_disassembly() {
+    let dir = std::env::temp_dir().join(format!("asc-diff-so-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let left_so = elf32(&[0x90, 0xc3]);
+    let right_so = elf32(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+    let (left, right) = write_pair(
+        &dir,
+        &[("lib/x86/libdemo.so", left_so.as_slice())],
+        &[("lib/x86/libdemo.so", right_so.as_slice())],
+    );
+    let diff = ArchiveDiff::between(
+        &Archive::open(&left).unwrap(),
+        &Archive::open(&right).unwrap(),
+    );
+    let shown = diff.to_string();
+    assert!(shown.contains("disasm code 0x1000"), "{shown}");
+    assert!(shown.contains("< "), "{shown}");
+    assert!(shown.contains("nop"), "{shown}");
+    assert!(shown.contains("> "), "{shown}");
+    assert!(shown.contains("mov"), "{shown}");
+    assert!(!shown.contains("symbols unchanged"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn elf32(code: &[u8]) -> Vec<u8> {
+    let shoff = 52usize;
+    let shentsize = 40usize;
+    let text_off = shoff + 4 * shentsize;
+    let sym_off = text_off + code.len();
+    let str_off = sym_off + 32;
+    let strings = b"\0work\0";
+    let mut file = vec![0u8; str_off + strings.len()];
+    file[0..4].copy_from_slice(b"\x7fELF");
+    file[4] = 1;
+    file[5] = 1;
+    file[6] = 1;
+    file[16..18].copy_from_slice(&3u16.to_le_bytes());
+    file[18..20].copy_from_slice(&3u16.to_le_bytes());
+    file[20..24].copy_from_slice(&1u32.to_le_bytes());
+    file[32..36].copy_from_slice(&(shoff as u32).to_le_bytes());
+    file[40..42].copy_from_slice(&52u16.to_le_bytes());
+    file[46..48].copy_from_slice(&(shentsize as u16).to_le_bytes());
+    file[48..50].copy_from_slice(&4u16.to_le_bytes());
+    write_sh32(
+        &mut file,
+        shoff,
+        1,
+        section(1, 6, text_off, code.len(), 0x1000),
+    );
+    write_sh32(&mut file, shoff, 2, section(11, 2, sym_off, 32, 0));
+    write_sh32(
+        &mut file,
+        shoff,
+        3,
+        section(3, 0, str_off, strings.len(), 0),
+    );
+    file[sym_off + 16..sym_off + 20].copy_from_slice(&1u32.to_le_bytes());
+    file[sym_off + 20..sym_off + 24].copy_from_slice(&0x1000u32.to_le_bytes());
+    file[sym_off + 24..sym_off + 28].copy_from_slice(&(code.len() as u32).to_le_bytes());
+    file[sym_off + 28] = 0x12;
+    file[sym_off + 30..sym_off + 32].copy_from_slice(&1u16.to_le_bytes());
+    file[text_off..text_off + code.len()].copy_from_slice(code);
+    file[str_off..str_off + strings.len()].copy_from_slice(strings);
+    file
+}
+
+struct Section {
+    kind: u32,
+    flags: u32,
+    offset: usize,
+    size: usize,
+    addr: u32,
+}
+
+fn section(kind: u32, flags: u32, offset: usize, size: usize, addr: u32) -> Section {
+    Section {
+        kind,
+        flags,
+        offset,
+        size,
+        addr,
+    }
+}
+
+fn write_sh32(file: &mut [u8], shoff: usize, index: usize, section: Section) {
+    let at = shoff + index * 40;
+    file[at + 4..at + 8].copy_from_slice(&section.kind.to_le_bytes());
+    file[at + 8..at + 12].copy_from_slice(&section.flags.to_le_bytes());
+    file[at + 12..at + 16].copy_from_slice(&section.addr.to_le_bytes());
+    file[at + 16..at + 20].copy_from_slice(&u32::try_from(section.offset).unwrap().to_le_bytes());
+    file[at + 20..at + 24].copy_from_slice(&u32::try_from(section.size).unwrap().to_le_bytes());
+    file[at + 24..at + 28].copy_from_slice(&3u32.to_le_bytes());
+    let entsize = if section.kind == 11 { 16u32 } else { 1 };
+    file[at + 36..at + 40].copy_from_slice(&entsize.to_le_bytes());
 }

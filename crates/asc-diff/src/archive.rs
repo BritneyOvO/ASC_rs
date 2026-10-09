@@ -21,6 +21,8 @@ pub struct FileEntry {
 /// The file list of one archive, keyed by entry path.
 #[derive(Clone, Debug)]
 pub struct Archive {
+    path: std::path::PathBuf,
+    items: Vec<Stored>,
     entries: Vec<FileEntry>,
     certificates: Vec<Certificate>,
 }
@@ -40,14 +42,39 @@ impl Archive {
             path: path.to_path_buf(),
             source,
         })?;
-        let (entries, mut certificates) = read_entries(&map)?;
+        let (items, mut certificates) = read_entries(&map)?;
         certificates.extend(cert::hap_certificates(&map));
         certificates.sort_by(|left, right| left.sha256.cmp(&right.sha256));
         certificates.dedup_by(|right, left| right.sha256 == left.sha256);
+        let entries = items.iter().map(|item| item.entry.clone()).collect();
         Ok(Self {
+            path: path.to_path_buf(),
+            items,
             entries,
             certificates,
         })
+    }
+
+    /// Inflates one archive member. Used when a shared object's CRC changed.
+    pub fn read(&self, name: &str) -> Result<Vec<u8>> {
+        let item = self
+            .items
+            .iter()
+            .find(|item| item.entry.name == name)
+            .ok_or_else(|| Error::new(format!("{name} is not in the archive")))?;
+        let file = File::open(&self.path).map_err(|source| Error::Io {
+            action: "open",
+            path: self.path.clone(),
+            source,
+        })?;
+        // SAFETY: the map is read-only and dropped before this function returns.
+        let map = unsafe { Mmap::map(&file) }.map_err(|source| Error::Io {
+            action: "map",
+            path: self.path.clone(),
+            source,
+        })?;
+        let limit = item.entry.size.clamp(1, 512 * 1024 * 1024);
+        inflate_entry(&map, item, limit)
     }
 
     pub fn entries(&self) -> &[FileEntry] {
@@ -63,6 +90,7 @@ fn is_meta_inf(name: &str) -> bool {
     name == "META-INF" || name.starts_with("META-INF/")
 }
 
+#[derive(Clone, Debug)]
 struct Stored {
     entry: FileEntry,
     method: u16,
@@ -70,7 +98,7 @@ struct Stored {
     local_header_offset: u64,
 }
 
-fn read_entries(apk: &[u8]) -> Result<(Vec<FileEntry>, Vec<Certificate>)> {
+fn read_entries(apk: &[u8]) -> Result<(Vec<Stored>, Vec<Certificate>)> {
     let (start, end) = cd_bounds(apk)?;
     let mut stored = Vec::new();
     let mut ptr = start;
@@ -87,35 +115,30 @@ fn read_entries(apk: &[u8]) -> Result<(Vec<FileEntry>, Vec<Certificate>)> {
         ptr = next;
     }
     let mut certificates = Vec::new();
-    let mut entries = Vec::new();
+    let mut items = Vec::new();
     for item in stored {
         if is_meta_inf(&item.entry.name) {
             if cert::is_signature_block(&item.entry.name) {
-                let bytes = inflate_entry(apk, &item)?;
+                let bytes = inflate_entry(apk, &item, 2 * 1024 * 1024)?;
                 certificates.extend(cert::certificates_in(&item.entry.name, &bytes));
             }
             continue;
         }
-        entries.push(item.entry);
+        items.push(item);
     }
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    entries.dedup_by(|right, left| right.name == left.name);
+    items.sort_by(|left, right| left.entry.name.cmp(&right.entry.name));
+    items.dedup_by(|right, left| right.entry.name == left.entry.name);
     certificates.sort_by(|left, right| left.sha256.cmp(&right.sha256));
     certificates.dedup_by(|right, left| right.sha256 == left.sha256);
-    Ok((entries, certificates))
+    Ok((items, certificates))
 }
 
-fn inflate_entry(apk: &[u8], item: &Stored) -> Result<Vec<u8>> {
-    const LIMIT: u64 = 2 * 1024 * 1024;
-    if item.entry.size > LIMIT {
-        bail!("{} is too large for a certificate", item.entry.name);
+fn inflate_entry(apk: &[u8], item: &Stored, limit: u64) -> Result<Vec<u8>> {
+    if item.entry.size > limit {
+        bail!("{} is larger than {limit} bytes", item.entry.name);
     }
-    let off = usize::try_from(item.local_header_offset).map_err(|_| {
-        Error::new(format!(
-            "zip offset for {} is too large",
-            item.entry.name
-        ))
-    })?;
+    let off = usize::try_from(item.local_header_offset)
+        .map_err(|_| Error::new(format!("zip offset for {} is too large", item.entry.name)))?;
     let name_len = usize::from(u16_at(apk, off + 26)?);
     let extra_len = usize::from(u16_at(apk, off + 28)?);
     let data_off = off + 30 + name_len + extra_len;
@@ -131,7 +154,7 @@ fn inflate_entry(apk: &[u8], item: &Stored) -> Result<Vec<u8>> {
         8 => {
             let mut out = Vec::new();
             DeflateDecoder::new(compressed)
-                .take(LIMIT)
+                .take(limit)
                 .read_to_end(&mut out)
                 .map_err(|source| Error::Io {
                     action: "inflate",
@@ -156,8 +179,10 @@ fn cd_bounds(apk: &[u8]) -> Result<(usize, usize)> {
     } else {
         (u64::from(cd_off_32), u64::from(cd_size_32))
     };
-    let start = usize::try_from(cd_off).map_err(|_| Error::new("central directory offset is too large"))?;
-    let size = usize::try_from(cd_size).map_err(|_| Error::new("central directory size is too large"))?;
+    let start =
+        usize::try_from(cd_off).map_err(|_| Error::new("central directory offset is too large"))?;
+    let size =
+        usize::try_from(cd_size).map_err(|_| Error::new("central directory size is too large"))?;
     let end = start
         .checked_add(size)
         .ok_or_else(|| Error::new("central directory exceeds file"))?;
