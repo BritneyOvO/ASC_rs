@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::path::{Component, Path};
 
 use crate::archive::{Archive, FileEntry};
 use crate::cert::Certificate;
+use crate::Result;
 
 /// Where an archive entry sits. The order of the variants is the report order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +68,8 @@ impl Group {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub name: String,
+    /// Path inside the archive. `name` may be the restored resource path.
+    pub member: String,
     pub size: u64,
 }
 
@@ -72,9 +77,34 @@ pub struct FileChange {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentChange {
     pub name: String,
+    /// Archive path of the earlier file.
+    pub left_member: String,
+    /// Archive path of the later file.
+    pub right_member: String,
     pub left_size: u64,
     pub right_size: u64,
     pub native: Option<NativeDiff>,
+    /// Decoded XML lines that differ. `None` when the entry is not compared as XML.
+    pub xml: Option<XmlDiff>,
+}
+
+/// One side of a decoded resource XML difference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XmlSide {
+    Left,
+    Right,
+}
+
+/// A short window of the decoded XML difference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmlDiff {
+    pub lines: Vec<XmlLine>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XmlLine {
+    pub side: XmlSide,
+    pub text: String,
 }
 
 /// ELF comparison for one shared object whose bytes changed.
@@ -154,29 +184,82 @@ impl ArchiveDiff {
         Self::between_prefix(left, right, "")
     }
 
+    /// Writes changed, added, and removed files under `dir`.
+    ///
+    /// Each archive is placed in a directory named with its `versionCode`.
+    /// XML is written as decoded text. Paths use the restored resource name.
+    pub fn export(&self, left: &Archive, right: &Archive, dir: &Path) -> Result<()> {
+        let left_code = version_code(left, "earlier")?;
+        let right_code = version_code(right, "later")?;
+        if left_code == right_code {
+            bail!("both archives have versionCode {left_code}");
+        }
+        let left_symbols = load_resources(left).symbols;
+        let right_symbols = load_resources(right).symbols;
+        let old = dir.join(&left_code);
+        let new = dir.join(&right_code);
+        for group in &self.groups {
+            for file in &group.removed {
+                write_export(left, &file.member, &file.name, &left_symbols, &old)?;
+            }
+            for file in &group.added {
+                write_export(right, &file.member, &file.name, &right_symbols, &new)?;
+            }
+            for file in &group.changed {
+                write_export(left, &file.left_member, &file.name, &left_symbols, &old)?;
+                write_export(right, &file.right_member, &file.name, &right_symbols, &new)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Like [`between`](Self::between), but only entries whose path starts with `prefix`.
     pub fn between_prefix(left: &Archive, right: &Archive, prefix: &str) -> Self {
-        let left_paths = resource_names(left);
-        let right_paths = resource_names(right);
-        let left_map = by_name(left.entries(), prefix, &left_paths);
-        let right_map = by_name(right.entries(), prefix, &right_paths);
+        let left_res = load_resources(left);
+        let right_res = load_resources(right);
+        let left_map = by_name(left.entries(), prefix, &left_res.paths);
+        let right_map = by_name(right.entries(), prefix, &right_res.paths);
         let mut groups: BTreeMap<Group, GroupDiff> = BTreeMap::new();
         for (name, entry) in &left_map {
             let group = ensure(&mut groups, name);
             match right_map.get(name) {
                 None => group.removed.push(FileChange {
                     name: name.to_string(),
+                    member: entry.name.clone(),
                     size: entry.size,
                 }),
                 Some(other) if other.crc == entry.crc && other.size == entry.size => {
                     group.unchanged += 1;
                 }
-                Some(other) => group.changed.push(ContentChange {
-                    name: name.to_string(),
-                    left_size: entry.size,
-                    right_size: other.size,
-                    native: native_diff(left, right, name),
-                }),
+                Some(other) => match xml_delta(
+                    left,
+                    right,
+                    entry,
+                    other,
+                    name,
+                    &left_res.symbols,
+                    &right_res.symbols,
+                ) {
+                    Some(XmlDelta::Same) => group.unchanged += 1,
+                    Some(XmlDelta::Different(xml)) => group.changed.push(ContentChange {
+                        name: name.to_string(),
+                        left_member: entry.name.clone(),
+                        right_member: other.name.clone(),
+                        left_size: entry.size,
+                        right_size: other.size,
+                        native: None,
+                        xml: Some(xml),
+                    }),
+                    None => group.changed.push(ContentChange {
+                        name: name.to_string(),
+                        left_member: entry.name.clone(),
+                        right_member: other.name.clone(),
+                        left_size: entry.size,
+                        right_size: other.size,
+                        native: native_diff(left, right, name),
+                        xml: None,
+                    }),
+                },
             }
         }
         for (name, entry) in &right_map {
@@ -185,6 +268,7 @@ impl ArchiveDiff {
             }
             ensure(&mut groups, name).added.push(FileChange {
                 name: name.to_string(),
+                member: entry.name.clone(),
                 size: entry.size,
             });
         }
@@ -287,11 +371,258 @@ fn ensure<'a>(groups: &'a mut BTreeMap<Group, GroupDiff>, name: &str) -> &'a mut
     })
 }
 
-fn resource_names(archive: &Archive) -> BTreeMap<String, String> {
-    let Ok(bytes) = archive.read("resources.arsc") else {
-        return BTreeMap::new();
+fn version_code(archive: &Archive, side: &str) -> Result<String> {
+    if let Some(name) = archive_member(archive, &["AndroidManifest.xml"], &["/AndroidManifest.xml"])
+    {
+        let text = manifest_text(&archive.read(name)?)?;
+        if let Some(code) = quoted_attr(&text, "versionCode") {
+            return Ok(code);
+        }
+    }
+    if let Some(name) = archive_member(
+        archive,
+        &["module.json", "config.json"],
+        &["/module.json", "/config.json"],
+    ) {
+        let text = String::from_utf8_lossy(&archive.read(name)?).into_owned();
+        if let Some(code) = json_version_code(&text) {
+            return Ok(code);
+        }
+    }
+    bail!("versionCode was not found in the {side} archive");
+}
+
+fn archive_member<'a>(archive: &'a Archive, exact: &[&str], suffixes: &[&str]) -> Option<&'a str> {
+    let entries = archive.entries();
+    for want in exact {
+        if let Some(entry) = entries.iter().find(|entry| entry.name == *want) {
+            return Some(entry.name.as_str());
+        }
+    }
+    for suffix in suffixes {
+        if let Some(entry) = entries.iter().find(|entry| entry.name.ends_with(suffix)) {
+            return Some(entry.name.as_str());
+        }
+    }
+    None
+}
+
+fn manifest_text(bytes: &[u8]) -> Result<String> {
+    if bytes.len() >= 2 && bytes[0] == 0x03 && bytes[1] == 0x00 {
+        return asc_axml::xml_text(bytes).map_err(|err| crate::Error::new(err.to_string()));
+    }
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn quoted_attr(text: &str, name: &str) -> Option<String> {
+    let key = format!("{name}=\"");
+    let mut rest = text;
+    while let Some(pos) = rest.find(&key) {
+        let value = &rest[pos + key.len()..];
+        let end = value.find('"')?;
+        let value = &value[..end];
+        if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Some(value.to_string());
+        }
+        rest = &rest[pos + key.len()..];
+    }
+    None
+}
+
+fn json_version_code(text: &str) -> Option<String> {
+    let key = "\"versionCode\"";
+    let mut rest = text;
+    while let Some(pos) = rest.find(key) {
+        let after = rest[pos + key.len()..].trim_start();
+        if let Some(after) = after.strip_prefix(':') {
+            let digits: String = after
+                .trim_start()
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
+                .map(char::from)
+                .collect();
+            if !digits.is_empty() {
+                return Some(digits);
+            }
+        }
+        rest = &rest[pos + key.len()..];
+    }
+    None
+}
+
+fn write_export(
+    archive: &Archive,
+    member: &str,
+    restored: &str,
+    symbols: &BTreeMap<u32, String>,
+    side_dir: &Path,
+) -> Result<()> {
+    let bytes = archive.read(member)?;
+    let payload = if is_xml_name(restored) {
+        decoded_xml(&bytes, symbols).map(Vec::from).unwrap_or(bytes)
+    } else {
+        bytes
     };
-    asc_apk::resource_paths(&bytes).unwrap_or_default()
+    let path = export_path(side_dir, restored)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| crate::Error::Io {
+            action: "create",
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::write(&path, payload).map_err(|source| crate::Error::Io {
+        action: "write",
+        path,
+        source,
+    })
+}
+
+fn is_xml_name(name: &str) -> bool {
+    name.rsplit('/').next().unwrap_or(name).ends_with(".xml")
+}
+
+fn export_path(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
+    if name.is_empty() {
+        bail!("{name} is not a safe export path");
+    }
+    let mut out = dir.to_path_buf();
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => bail!("{name} is not a safe export path"),
+        }
+    }
+    Ok(out)
+}
+
+fn load_resources(archive: &Archive) -> asc_apk::CompiledResources {
+    let Ok(bytes) = archive.read("resources.arsc") else {
+        return asc_apk::CompiledResources::default();
+    };
+    asc_apk::compiled_resources(&bytes).unwrap_or_default()
+}
+
+enum XmlDelta {
+    Same,
+    Different(XmlDiff),
+}
+
+fn xml_delta(
+    left: &Archive,
+    right: &Archive,
+    left_entry: &FileEntry,
+    right_entry: &FileEntry,
+    name: &str,
+    left_symbols: &BTreeMap<u32, String>,
+    right_symbols: &BTreeMap<u32, String>,
+) -> Option<XmlDelta> {
+    if Group::of(name) != Group::Res || !name.ends_with(".xml") {
+        return None;
+    }
+    let left_bytes = left.read(&left_entry.name).ok()?;
+    let right_bytes = right.read(&right_entry.name).ok()?;
+    let left_text = decoded_xml(&left_bytes, left_symbols)?;
+    let right_text = decoded_xml(&right_bytes, right_symbols)?;
+    if left_text == right_text {
+        Some(XmlDelta::Same)
+    } else {
+        Some(XmlDelta::Different(XmlDiff {
+            lines: xml_window(&left_text, &right_text),
+        }))
+    }
+}
+
+fn decoded_xml(bytes: &[u8], symbols: &BTreeMap<u32, String>) -> Option<String> {
+    let text = if bytes.len() >= 2 && bytes[0] == 0x03 && bytes[1] == 0x00 {
+        asc_axml::xml_text(bytes).ok()?
+    } else {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        if !text.trim_start().starts_with('<') {
+            return None;
+        }
+        text
+    };
+    Some(apply_symbols(&text, symbols))
+}
+
+fn apply_symbols(text: &str, symbols: &BTreeMap<u32, String>) -> String {
+    if symbols.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = hex_ref_end(bytes, index) {
+            if let Ok(id) = u32::from_str_radix(&text[index + 3..end], 16) {
+                if let Some(name) = symbols.get(&id) {
+                    out.push('@');
+                    out.push_str(name);
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        let Some(ch) = text[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+fn hex_ref_end(bytes: &[u8], index: usize) -> Option<usize> {
+    if bytes.get(index) != Some(&b'@')
+        || bytes.get(index + 1) != Some(&b'0')
+        || !matches!(bytes.get(index + 2), Some(b'x' | b'X'))
+    {
+        return None;
+    }
+    let mut end = index + 3;
+    while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+        end += 1;
+    }
+    (end - (index + 3) == 8).then_some(end)
+}
+
+const XML_LINES: usize = 12;
+
+fn xml_window(left: &str, right: &str) -> Vec<XmlLine> {
+    let left: Vec<&str> = left.lines().collect();
+    let right: Vec<&str> = right.lines().collect();
+    let mut start = 0;
+    while start < left.len() && start < right.len() && left[start] == right[start] {
+        start += 1;
+    }
+    let mut end_left = left.len();
+    let mut end_right = right.len();
+    while end_left > start && end_right > start && left[end_left - 1] == right[end_right - 1] {
+        end_left -= 1;
+        end_right -= 1;
+    }
+    let mut lines = Vec::new();
+    for line in left.iter().take(end_left).skip(start) {
+        if lines.len() >= XML_LINES {
+            break;
+        }
+        lines.push(XmlLine {
+            side: XmlSide::Left,
+            text: (*line).to_string(),
+        });
+    }
+    for line in right.iter().take(end_right).skip(start) {
+        if lines.len() >= XML_LINES {
+            break;
+        }
+        lines.push(XmlLine {
+            side: XmlSide::Right,
+            text: (*line).to_string(),
+        });
+    }
+    lines
 }
 
 fn by_name<'a>(
@@ -367,6 +698,16 @@ impl fmt::Display for ArchiveDiff {
                     "  ~ {}  {} -> {} bytes",
                     entry.name, entry.left_size, entry.right_size
                 )?;
+                if let Some(xml) = &entry.xml {
+                    writeln!(formatter, "    xml")?;
+                    for line in &xml.lines {
+                        let mark = match line.side {
+                            XmlSide::Left => '<',
+                            XmlSide::Right => '>',
+                        };
+                        writeln!(formatter, "      {mark} {}", line.text)?;
+                    }
+                }
                 if let Some(native) = &entry.native {
                     write_native(formatter, native)?;
                 }

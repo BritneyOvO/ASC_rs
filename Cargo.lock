@@ -130,6 +130,7 @@ name = "asc-diff"
 version = "0.1.0"
 dependencies = [
  "asc-apk",
+ "asc-axml",
  "asc-so",
  "crc32fast",
  "flate2",

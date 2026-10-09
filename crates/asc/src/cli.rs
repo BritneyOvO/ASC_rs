@@ -55,6 +55,7 @@ Inflated DEX entries are cached under ~/.cache/asc unless --no-cache is set.
 
   asc diff old.apk new.apk
   asc diff --prefix assets/ old.apk new.apk
+  asc diff old.apk new.apk -o diff-out
   asc skills install
 
 asc skills install writes:
@@ -207,11 +208,15 @@ enum Commands {
     /// Compare two APK, HAP, or HSP archives by file path and CRC.
     /// Changed native libraries also compare ELF symbols and disassemble
     /// x86, x86_64, and AArch64 code. Short `r/` paths are restored from
-    /// resources.arsc before entries are matched.
+    /// resources.arsc before entries are matched, and `res` XML is compared
+    /// as decoded text. `-o` writes changed files under each versionCode.
     Diff {
         /// Only entries whose path starts with this prefix, such as assets/.
         #[arg(long)]
         prefix: Option<String>,
+        /// Directory for changed files. XML is decoded text with restored names.
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<PathBuf>,
         /// The earlier archive.
         left: PathBuf,
         /// The later archive.
@@ -526,6 +531,7 @@ fn execute(cli: Cli) -> Result<Exit> {
         }
         Commands::Diff {
             prefix,
+            output,
             left,
             right,
         } => {
@@ -538,6 +544,11 @@ fn execute(cli: Cli) -> Result<Exit> {
                 None => asc_diff::ArchiveDiff::between(&left_archive, &right_archive),
             };
             print!("{report}");
+            if let Some(dir) = output {
+                report
+                    .export(&left_archive, &right_archive, &dir)
+                    .map_err(Error::external)?;
+            }
         }
         Commands::Skills { action } => match action {
             SkillsCmd::Install => install_user_skills()?,

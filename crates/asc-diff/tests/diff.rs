@@ -445,3 +445,182 @@ fn file_arsc(path: &str) -> Vec<u8> {
     put_u32(&mut table, 4, table_len);
     table
 }
+
+#[test]
+fn identical_decoded_xml_is_unchanged_when_bytes_differ() {
+    let dir = std::env::temp_dir().join(format!("asc-diff-xml-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut right = binary_layout("Hello");
+    right.push(0);
+    let (left, right) = write_pair(
+        &dir,
+        &[("res/layout/a.xml", &binary_layout("Hello"))],
+        &[("res/layout/a.xml", &right)],
+    );
+    let diff = ArchiveDiff::between(
+        &Archive::open(&left).unwrap(),
+        &Archive::open(&right).unwrap(),
+    );
+    let shown = diff.to_string();
+    assert!(
+        shown.contains("res: changed 0, added 0, removed 0, unchanged 1"),
+        "{shown}"
+    );
+    assert!(!shown.contains("~ res/layout/a.xml"), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decoded_xml_differences_are_shown() {
+    let dir = std::env::temp_dir().join(format!("asc-diff-xml2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (left, right) = write_pair(
+        &dir,
+        &[("res/layout/a.xml", &binary_layout("Hello"))],
+        &[("res/layout/a.xml", &binary_layout("World"))],
+    );
+    let diff = ArchiveDiff::between(
+        &Archive::open(&left).unwrap(),
+        &Archive::open(&right).unwrap(),
+    );
+    let shown = diff.to_string();
+    assert!(shown.contains("~ res/layout/a.xml"), "{shown}");
+    assert!(shown.contains("xml"), "{shown}");
+    assert!(shown.contains("< "), "{shown}");
+    assert!(shown.contains("text=\"Hello\""), "{shown}");
+    assert!(shown.contains("> "), "{shown}");
+    assert!(shown.contains("text=\"World\""), "{shown}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn export_writes_both_sides_as_decoded_xml() {
+    let dir = std::env::temp_dir().join(format!("asc-diff-export-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out");
+    let (left, right) = write_pair(
+        &dir,
+        &[
+            (
+                "AndroidManifest.xml",
+                br#"<manifest android:versionCode="10" />"#,
+            ),
+            ("resources.arsc", &file_arsc("r/d/c.xml")),
+            ("r/d/c.xml", &binary_layout("Hello")),
+            ("assets/keep.txt", b"same"),
+            ("assets/gone.txt", b"old"),
+        ],
+        &[
+            (
+                "AndroidManifest.xml",
+                br#"<manifest android:versionCode="20" />"#,
+            ),
+            ("resources.arsc", &file_arsc("r/ab/z.xml")),
+            ("r/ab/z.xml", &binary_layout("World")),
+            ("assets/keep.txt", b"same"),
+            ("assets/new.txt", b"fresh"),
+        ],
+    );
+    let left_archive = Archive::open(&left).unwrap();
+    let right_archive = Archive::open(&right).unwrap();
+    let diff = ArchiveDiff::between(&left_archive, &right_archive);
+    diff.export(&left_archive, &right_archive, &out).unwrap();
+    let old_xml = std::fs::read_to_string(out.join("10/res/drawable-hdpi/icon.xml")).unwrap();
+    let new_xml = std::fs::read_to_string(out.join("20/res/drawable-hdpi/icon.xml")).unwrap();
+    assert!(old_xml.starts_with("<?xml"), "{old_xml}");
+    assert!(old_xml.contains("text=\"Hello\""), "{old_xml}");
+    assert!(new_xml.contains("text=\"World\""), "{new_xml}");
+    assert_eq!(
+        std::fs::read(out.join("10/assets/gone.txt")).unwrap(),
+        b"old"
+    );
+    assert_eq!(
+        std::fs::read(out.join("20/assets/new.txt")).unwrap(),
+        b"fresh"
+    );
+    assert!(!out.join("10/assets/keep.txt").exists());
+    assert!(!out.join("20/assets/keep.txt").exists());
+    assert!(!out.join("old").exists());
+    assert!(!out.join("10/r").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn binary_layout(label: &str) -> Vec<u8> {
+    fn push_u16(buf: &mut Vec<u8>, value: u16) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+    let strings = ["layout", "text", label];
+    let mut data = Vec::new();
+    let mut offsets = Vec::new();
+    for value in strings {
+        offsets.push(u32::try_from(data.len()).unwrap());
+        data.push(u8::try_from(value.chars().count()).unwrap());
+        data.push(u8::try_from(value.len()).unwrap());
+        data.extend_from_slice(value.as_bytes());
+        data.push(0);
+    }
+    while data.len() % 4 != 0 {
+        data.push(0);
+    }
+    let strings_start = 28 + u32::try_from(strings.len()).unwrap() * 4;
+    let mut pool = Vec::new();
+    push_u16(&mut pool, 0x0001);
+    push_u16(&mut pool, 28);
+    push_u32(
+        &mut pool,
+        strings_start + u32::try_from(data.len()).unwrap(),
+    );
+    push_u32(&mut pool, u32::try_from(strings.len()).unwrap());
+    push_u32(&mut pool, 0);
+    push_u32(&mut pool, 1 << 8);
+    push_u32(&mut pool, strings_start);
+    push_u32(&mut pool, 0);
+    for offset in offsets {
+        push_u32(&mut pool, offset);
+    }
+    pool.extend_from_slice(&data);
+    let mut element = Vec::new();
+    push_u16(&mut element, 0x0102);
+    push_u16(&mut element, 16);
+    push_u32(&mut element, 16 + 20 + 20);
+    push_u32(&mut element, 1);
+    push_u32(&mut element, 0xffff_ffff);
+    push_u32(&mut element, 0xffff_ffff);
+    push_u32(&mut element, 0);
+    push_u16(&mut element, 20);
+    push_u16(&mut element, 20);
+    push_u16(&mut element, 1);
+    push_u16(&mut element, 0);
+    push_u16(&mut element, 0);
+    push_u16(&mut element, 0);
+    push_u32(&mut element, 0xffff_ffff);
+    push_u32(&mut element, 1);
+    push_u32(&mut element, 2);
+    push_u16(&mut element, 8);
+    element.push(0);
+    element.push(0x03);
+    push_u32(&mut element, 2);
+    let mut end = Vec::new();
+    push_u16(&mut end, 0x0103);
+    push_u16(&mut end, 16);
+    push_u32(&mut end, 24);
+    push_u32(&mut end, 1);
+    push_u32(&mut end, 0xffff_ffff);
+    push_u32(&mut end, 0xffff_ffff);
+    push_u32(&mut end, 0);
+    let mut body = pool;
+    body.extend(element);
+    body.extend(end);
+    let mut file = Vec::new();
+    push_u16(&mut file, 0x0003);
+    push_u16(&mut file, 8);
+    push_u32(&mut file, u32::try_from(8 + body.len()).unwrap());
+    file.extend(body);
+    file
+}

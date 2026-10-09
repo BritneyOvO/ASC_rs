@@ -17,9 +17,14 @@ const MAX_DEPTH: usize = 256;
 
 pub fn manifest_xml(data: &[u8]) -> Result<String> {
     if data.len() >= 8 && u16_at(data, 0)? == 0x0003 {
-        return binary_manifest_xml(data);
+        return xml_text(data);
     }
     proto_manifest_xml(data)
+}
+
+/// Decodes a binary Android XML document, such as a compiled layout.
+pub fn xml_text(data: &[u8]) -> Result<String> {
+    binary_manifest_xml(data)
 }
 
 fn binary_manifest_xml(data: &[u8]) -> Result<String> {
@@ -303,12 +308,7 @@ fn read_cdata(chunk: &[u8], pool: &[String]) -> Option<String> {
     Some(pool_get(pool, raw))
 }
 
-fn qualify_local(
-    pool: &[String],
-    ns: u32,
-    local: &str,
-    namespaces: &[(String, String)],
-) -> String {
+fn qualify_local(pool: &[String], ns: u32, local: &str, namespaces: &[(String, String)]) -> String {
     if ns == 0xffff_ffff {
         return local.to_string();
     }
@@ -429,7 +429,8 @@ fn element_to_node_at(
             }
         }
         if let Some(inner) = &child.element {
-            node.children.push(element_to_node_at(inner, &prefixes, depth + 1)?);
+            node.children
+                .push(element_to_node_at(inner, &prefixes, depth + 1)?);
         }
     }
     Ok(node)

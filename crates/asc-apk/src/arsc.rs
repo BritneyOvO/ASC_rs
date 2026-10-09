@@ -542,12 +542,26 @@ fn render_value(data_type: u8, data: u32, global: &[String]) -> Option<(String, 
 /// name, so the shortened path can be put back. A path that does not name a
 /// file resource is left out. Two entries that would restore to the same path
 /// are left out as well, so a later diff does not merge unrelated files.
+/// File-path restoration and `0x7f......` resource ids from one `resources.arsc`.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledResources {
+    pub paths: BTreeMap<String, String>,
+    /// Resource id to `type/name`, without the leading `@`.
+    pub symbols: BTreeMap<u32, String>,
+}
+
 pub fn resource_paths(data: &[u8]) -> Result<BTreeMap<String, String>> {
+    Ok(compiled_resources(data)?.paths)
+}
+
+/// Reads shortened file paths and resource id names from `resources.arsc`.
+pub fn compiled_resources(data: &[u8]) -> Result<CompiledResources> {
     if data.len() < 12 || u16_at(data, 0)? != 0x0002 {
         bail!("resources.arsc is not a resource table");
     }
     let header_size = usize::from(u16_at(data, 2)?);
     let mut pairs = Vec::new();
+    let mut symbols = BTreeMap::new();
     let mut global = Vec::new();
     let mut pos = header_size.max(12);
     while pos + 8 <= data.len() {
@@ -559,7 +573,7 @@ pub fn resource_paths(data: &[u8]) -> Result<BTreeMap<String, String>> {
         let chunk = &data[pos..pos + size];
         match kind {
             0x0001 => global = parse_pool(chunk)?,
-            0x0200 => collect_package_paths(chunk, &global, &mut pairs)?,
+            0x0200 => collect_package_paths(chunk, &global, &mut pairs, &mut symbols)?,
             _ => {}
         }
         pos += size;
@@ -568,16 +582,18 @@ pub fn resource_paths(data: &[u8]) -> Result<BTreeMap<String, String>> {
     for (_, restored) in &pairs {
         *counts.entry(restored.clone()).or_default() += 1;
     }
-    Ok(pairs
+    let paths = pairs
         .into_iter()
         .filter(|(_, restored)| counts.get(restored) == Some(&1))
-        .collect())
+        .collect();
+    Ok(CompiledResources { paths, symbols })
 }
 
 fn collect_package_paths(
     chunk: &[u8],
     global: &[String],
     pairs: &mut Vec<(String, String)>,
+    symbols: &mut BTreeMap<u32, String>,
 ) -> Result<()> {
     if chunk.len() < 284 {
         return Ok(());
@@ -590,6 +606,7 @@ fn collect_package_paths(
     }
     let type_pool = parse_pool(&chunk[type_off..])?;
     let key_pool = parse_pool(&chunk[key_off..])?;
+    let package_id = u32_at(chunk, 8)?;
     let mut pos = header_size;
     while pos + 8 <= chunk.len() {
         let kind = u16_at(chunk, pos)?;
@@ -603,7 +620,9 @@ fn collect_package_paths(
                 &type_pool,
                 &key_pool,
                 global,
+                package_id,
                 pairs,
+                symbols,
             );
         }
         pos += size;
@@ -616,7 +635,9 @@ fn collect_type_paths(
     type_pool: &[String],
     key_pool: &[String],
     global: &[String],
+    package_id: u32,
     pairs: &mut Vec<(String, String)>,
+    symbols: &mut BTreeMap<u32, String>,
 ) {
     if chunk.len() < 20 {
         return;
@@ -639,27 +660,44 @@ fn collect_type_paths(
     }
     let qualifiers = config_qualifiers(chunk);
     for index in 0..entry_count {
-        let Some((.., entry_at)) = entry_offset(chunk, header_size, entries_start, flags, index)
+        let Some((entry_index, entry_at)) =
+            entry_offset(chunk, header_size, entries_start, flags, index)
         else {
             continue;
         };
-        let Some((key, value, _)) = read_entry(chunk, entry_at, global) else {
+        let Some(key) = entry_key(chunk, entry_at) else {
             continue;
         };
         let Some(entry_name) = key_pool.get(usize::try_from(key).unwrap_or(usize::MAX)) else {
             continue;
         };
-        let Some(zip_path) = resource_zip_path(&value) else {
-            continue;
-        };
         if entry_name.is_empty() || entry_name.contains('/') {
             continue;
         }
+        if let Ok(index) = u32::try_from(entry_index) {
+            let res_id = (package_id << 24) | (u32::from(id) << 16) | index;
+            symbols
+                .entry(res_id)
+                .or_insert_with(|| format!("{type_name}/{entry_name}"));
+        }
+        let Some((.., value, _)) = read_entry(chunk, entry_at, global) else {
+            continue;
+        };
+        let Some(zip_path) = resource_zip_path(&value) else {
+            continue;
+        };
         let restored = restored_path(type_name, &qualifiers, entry_name, extension(zip_path));
         if restored != zip_path {
             pairs.push((zip_path.to_string(), restored));
         }
     }
+}
+
+fn entry_key(chunk: &[u8], at: usize) -> Option<u32> {
+    if at + 8 > chunk.len() {
+        return None;
+    }
+    u32_at(chunk, at + 4).ok()
 }
 
 fn resource_zip_path(value: &str) -> Option<&str> {
